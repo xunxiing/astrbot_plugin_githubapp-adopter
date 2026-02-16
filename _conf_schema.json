@@ -1,43 +1,43 @@
 {
   "private_key_files": {
-    "description": "GitHub App Private Key (.pem)",
+    "description": "GitHub App 私钥（.pem）",
     "type": "file",
     "file_types": [
       "pem"
     ],
-    "hint": "Upload one .pem private key file for GitHub App credentials.",
+    "hint": "上传 GitHub App 的私钥文件（PEM 格式）。支持多个文件，实际使用时会取第一个可用文件。",
     "default": []
   },
   "default_github_events": {
-    "description": "Default GitHub Events",
+    "description": "默认接收的 GitHub 事件",
     "type": "list",
-    "hint": "Fallback event allowlist when platform config github_events is empty. Empty means all supported events.",
+    "hint": "当平台配置中的 github_events 为空时，使用这里作为兜底订阅列表。留空表示接收全部已支持事件。",
     "default": []
   },
   "default_wake_event_types": {
-    "description": "Default Wake Event Types",
+    "description": "默认唤醒事件类型",
     "type": "list",
-    "hint": "Fallback wake-event allowlist when platform config wake_event_types is empty.",
+    "hint": "当平台配置中的 wake_event_types 为空时，使用这里作为兜底唤醒事件列表。",
     "default": [
       "issues",
       "pull_request"
     ]
   },
   "enable_signature_validation": {
-    "description": "Enable signature validation",
+    "description": "启用签名校验",
     "type": "bool",
     "default": true
   },
   "delivery_cache_ttl_seconds": {
-    "description": "Delivery dedup cache ttl",
+    "description": "Delivery 去重缓存 TTL（秒）",
     "type": "int",
     "default": 900,
-    "hint": "Replay protection window in seconds."
+    "hint": "重放保护窗口（秒）。"
   },
   "delivery_cache_max_entries": {
-    "description": "Delivery dedup cache max entries",
+    "description": "Delivery 去重缓存最大条目数",
     "type": "int",
     "default": 10000,
-    "hint": "Upper bound for in-memory dedup cache."
+    "hint": "内存去重缓存的上限。"
   }
 }

@@ -33,65 +33,65 @@ def _inject_platform_metadata() -> None:
         {
             "description": "GitHub App ID",
             "type": "string",
-            "hint": "GitHub App settings page value.",
+            "hint": "GitHub App 设置页中的 App ID。",
         },
     )
     items.setdefault(
         "github_webhook_secret",
         {
-            "description": "GitHub Webhook Secret",
+            "description": "GitHub Webhook 密钥",
             "type": "string",
-            "hint": "Must match webhook secret in GitHub App.",
+            "hint": "必须与 GitHub App 中配置的 Webhook Secret 保持一致。",
         },
     )
     items.setdefault(
         "github_api_base_url",
         {
-            "description": "GitHub API Base URL",
+            "description": "GitHub API 基础地址",
             "type": "string",
-            "hint": "Default is https://api.github.com.",
+            "hint": "默认值为 https://api.github.com。",
         },
     )
     items.setdefault(
         "github_events",
         {
-            "description": "GitHub Events",
+            "description": "GitHub 事件订阅",
             "type": "list",
-            "hint": "Empty means all supported events.",
+            "hint": "留空表示订阅全部已支持事件。",
             "options": SUPPORTED_GITHUB_EVENTS,
         },
     )
     items.setdefault(
         "wake_event_types",
         {
-            "description": "Wake Event Types",
+            "description": "唤醒事件类型",
             "type": "list",
-            "hint": "Only these events trigger LLM wake.",
+            "hint": "仅这些事件会触发 LLM 唤醒。",
             "options": SUPPORTED_GITHUB_EVENTS,
         },
     )
     items.setdefault(
         "github_signature_validation",
         {
-            "description": "Enable Signature Validation",
+            "description": "启用签名校验",
             "type": "bool",
-            "hint": "Verify X-Hub-Signature-256 for each webhook request.",
+            "hint": "校验每次 Webhook 请求的 X-Hub-Signature-256。",
         },
     )
     items.setdefault(
         "github_delivery_cache_ttl_seconds",
         {
-            "description": "Delivery Dedup TTL (seconds)",
+            "description": "Delivery 去重 TTL（秒）",
             "type": "int",
-            "hint": "Replay protection window.",
+            "hint": "重放保护窗口。",
         },
     )
     items.setdefault(
         "github_delivery_cache_max_entries",
         {
-            "description": "Delivery Dedup Max Entries",
+            "description": "Delivery 去重最大条目数",
             "type": "int",
-            "hint": "Upper bound for in-memory dedup cache size.",
+            "hint": "内存去重缓存容量上限。",
         },
     )
 
@@ -101,7 +101,7 @@ def _inject_platform_metadata() -> None:
 @register(
     "astrbot_plugin_githubapp-adopter",
     "OpenCode",
-    "GitHub App webhook platform adapter for AstrBot",
+    "为 AstrBot 提供 GitHub App Webhook 平台适配器",
     "v0.1.2",
     "https://github.com/example/astrbot_plugin_githubapp-adopter",
 )

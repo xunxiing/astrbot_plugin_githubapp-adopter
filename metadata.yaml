@@ -1,6 +1,6 @@
 name: astrbot_plugin_githubapp-adopter
-display_name: GitHub App Adopter
-desc: Register a GitHub App webhook platform adapter for AstrBot.
+display_name: GitHub App 适配器
+desc: 为 AstrBot 注册 GitHub App Webhook 平台适配器。
 version: v0.1.2
 author: OpenCode
 repo: https://github.com/example/astrbot_plugin_githubapp-adopter

@@ -124,7 +124,7 @@ def _read_first_valid_private_key_text(paths: list[str]) -> str:
 
 @register_platform_adapter(
     "github_app",
-    "GitHub App webhook adapter for AstrBot",
+    "GitHub App Webhook 适配器（AstrBot）",
     default_config_tmpl={
         "id": "github_app",
         "type": "github_app",
@@ -140,7 +140,7 @@ def _read_first_valid_private_key_text(paths: list[str]) -> str:
         "unified_webhook_mode": True,
         "webhook_uuid": "",
     },
-    adapter_display_name="GitHub App",
+    adapter_display_name="GitHub 应用",
     support_streaming_message=False,
 )
 class GitHubAppAdapter(Platform):
@@ -157,7 +157,7 @@ class GitHubAppAdapter(Platform):
         platform_id = cast(str, platform_config.get("id", "github_app"))
         self._metadata = PlatformMetadata(
             name="github_app",
-            description="GitHub App webhook adapter for AstrBot",
+            description="GitHub App Webhook 适配器（AstrBot）",
             id=platform_id,
             support_streaming_message=False,
         )
