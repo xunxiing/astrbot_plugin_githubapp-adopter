@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from astrbot.api import logger
-from astrbot.api.event import filter
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
 from astrbot.core.config.default import CONFIG_METADATA_2, WEBHOOK_SUPPORTED_PLATFORMS
 
@@ -22,6 +24,10 @@ SUPPORTED_GITHUB_EVENTS = [
     "fork",
 ]
 RUNTIME_PLUGIN_CONFIG: dict[str, Any] = {}
+IMAGE_ATTACHMENT_PATH_HINT_RE = re.compile(
+    r"^\[Image Attachment:\s*path\s+.+\]$",
+    re.IGNORECASE,
+)
 
 
 def set_runtime_plugin_config(config: dict | None) -> None:
@@ -102,6 +108,14 @@ def _inject_platform_metadata() -> None:
         },
     )
     items.setdefault(
+        "ignore_bot_sender_events",
+        {
+            "description": "Ignore bot sender events",
+            "type": "bool",
+            "hint": "Ignore webhook events when sender is a GitHub Bot account.",
+        },
+    )
+    items.setdefault(
         "github_signature_validation",
         {
             "description": "启用签名校验",
@@ -148,3 +162,35 @@ class GitHubAppAdopterPlugin(Star):
     async def on_astrbot_loaded(self):
         set_runtime_plugin_config(self.config)
         _inject_platform_metadata()
+
+    @filter.on_llm_request(priority=-20000)
+    async def fix_github_image_llm_request(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ):
+        if event.get_platform_name() != GITHUB_ADAPTER_TYPE:
+            return
+        if not req.image_urls:
+            return
+
+        removed_hint_parts = 0
+        kept_parts = []
+        for part in req.extra_user_content_parts:
+            part_type = str(getattr(part, "type", "")).lower()
+            if part_type == "text":
+                text = str(getattr(part, "text", "")).strip()
+                if IMAGE_ATTACHMENT_PATH_HINT_RE.match(text):
+                    removed_hint_parts += 1
+                    continue
+            kept_parts.append(part)
+        if removed_hint_parts:
+            req.extra_user_content_parts = kept_parts
+
+        hint = (
+            "The image is already provided via multimodal input. "
+            "Do not call tools just to open local file paths; "
+            "analyze the attached image directly."
+        )
+        if hint not in req.system_prompt:
+            req.system_prompt = f"{req.system_prompt}\n{hint}".strip()

@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import At, File, Image, Plain
 from astrbot.api.platform import (
     AstrBotMessage,
     MessageMember,
@@ -44,8 +44,20 @@ from .security import (
 )
 
 PLUGIN_ROOT_DIR = "astrbot_plugin_githubapp-adopter"
-ADAPTER_BUILD_MARK = "2026-02-17.2"
+ADAPTER_BUILD_MARK = "2026-02-17.15"
 MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9_])@[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+HTML_IMAGE_SRC_PATTERN = re.compile(
+    r"""<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*>""",
+    re.IGNORECASE,
+)
+HTML_LINK_HREF_PATTERN = re.compile(
+    r"""<a\b[^>]*\bhref=["']([^"']+)["'][^>]*>""",
+    re.IGNORECASE,
+)
+MARKDOWN_IMAGE_PATTERN = re.compile(
+    r"""!\[[^\]]*]\((https?://[^)\s]+)\)""",
+    re.IGNORECASE,
+)
 SENDABLE_THREAD_TYPES = {"issue", "pr"}
 
 
@@ -135,14 +147,62 @@ def _ensure_list(value: Any) -> list[str]:
     return []
 
 
-def _make_message_chain_text(message_chain: MessageChain) -> str:
+async def _make_message_chain_github_body(message_chain: MessageChain) -> str:
     parts: list[str] = []
     for component in message_chain.chain:
         if isinstance(component, Plain):
-            parts.append(component.text)
-        else:
-            parts.append(f"[{component.type}]")
-    return "".join(parts).strip()
+            text = component.text or ""
+            if text:
+                parts.append(text)
+            continue
+
+        if isinstance(component, At):
+            mention = component.name or str(component.qq)
+            if mention:
+                parts.append(f"@{mention}")
+            continue
+
+        if isinstance(component, Image):
+            image_url = await _resolve_image_component_url(component)
+            if image_url:
+                parts.append(f"![image]({image_url})")
+            else:
+                parts.append("[image]")
+            continue
+
+        if isinstance(component, File):
+            file_url = await _resolve_file_component_url(component)
+            if file_url:
+                file_name = component.name or "file"
+                parts.append(f"[{file_name}]({file_url})")
+            else:
+                parts.append(f"[file:{component.name or 'unknown'}]")
+            continue
+
+        parts.append(f"[{component.type}]")
+
+    body = "\n\n".join(p.strip() for p in parts if p and p.strip()).strip()
+    return body
+
+
+async def _resolve_image_component_url(component: Image) -> str:
+    url = (component.url or component.file or "").strip()
+    if url.startswith(("http://", "https://")):
+        return url
+    try:
+        return await component.register_to_file_service()
+    except Exception:
+        return ""
+
+
+async def _resolve_file_component_url(component: File) -> str:
+    url = (component.url or "").strip()
+    if url.startswith(("http://", "https://")):
+        return url
+    try:
+        return await component.register_to_file_service()
+    except Exception:
+        return ""
 
 
 def _normalize_pem_text(text: Any) -> str:
@@ -200,17 +260,166 @@ def _extract_mention_candidate_texts(event_name: str, payload: Mapping) -> list[
             if text:
                 candidates.append(text)
 
-    append_body(payload.get("comment"))
-    append_body(payload.get("review"))
-
-    if event_name in {"issues", "issue_comment"}:
+    # Only inspect the event's primary content source.
+    # Avoid mixing parent issue/PR bodies into comment events, which causes
+    # false mention/image matches from historical content.
+    if event_name == "issue_comment":
+        append_body(payload.get("comment"))
+    elif event_name == "issues":
         append_body(payload.get("issue"))
-    if event_name.startswith("pull_request"):
+    elif event_name == "pull_request_review_comment":
+        append_body(payload.get("comment"))
+    elif event_name == "pull_request_review":
+        append_body(payload.get("review"))
+    elif event_name == "pull_request":
         append_body(payload.get("pull_request"))
-    if event_name.startswith("discussion"):
+    elif event_name == "discussion_comment":
+        append_body(payload.get("comment"))
+    elif event_name == "discussion":
         append_body(payload.get("discussion"))
+    else:
+        append_body(payload.get("comment"))
+        append_body(payload.get("review"))
 
     return candidates
+
+
+def _extract_image_urls_from_text(text: str) -> list[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    urls: list[str] = []
+    urls.extend(m.group(1).strip() for m in MARKDOWN_IMAGE_PATTERN.finditer(text))
+    urls.extend(m.group(1).strip() for m in HTML_IMAGE_SRC_PATTERN.finditer(text))
+    for m in HTML_LINK_HREF_PATTERN.finditer(text):
+        href = m.group(1).strip()
+        if not href.startswith(("http://", "https://")):
+            continue
+        href_lower = href.lower()
+        if (
+            "/user-attachments/assets/" in href_lower
+            or href_lower.endswith(
+                (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg")
+            )
+        ):
+            urls.append(href)
+    return list(dict.fromkeys(u for u in urls if u.startswith(("http://", "https://"))))
+
+
+def _build_repo_image_cdn_candidates(image_url: str) -> list[str]:
+    if not isinstance(image_url, str):
+        return []
+    try:
+        parsed = parse.urlparse(image_url)
+    except Exception:
+        return []
+    host = (parsed.netloc or "").lower()
+    path = parse.unquote(parsed.path or "")
+    segments = [seg for seg in path.strip("/").split("/") if seg]
+
+    owner = ""
+    repo = ""
+    ref = ""
+    file_path = ""
+    candidates: list[str] = []
+
+    if host == "raw.githubusercontent.com" and len(segments) >= 4:
+        owner, repo, ref = segments[0], segments[1], segments[2]
+        file_path = "/".join(segments[3:])
+    elif host == "github.com" and len(segments) >= 5 and segments[2] in {
+        "blob",
+        "raw",
+    }:
+        owner, repo, mode = segments[0], segments[1], segments[2]
+        ref = segments[3]
+        file_path = "/".join(segments[4:])
+        if mode == "blob":
+            candidates.append(
+                f"https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{file_path}"
+            )
+
+    if owner and repo and ref and file_path:
+        candidates.insert(
+            0,
+            f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{ref}/{file_path}",
+        )
+        candidates.insert(
+            1,
+            f"https://cdn.statically.io/gh/{owner}/{repo}/{ref}/{file_path}",
+        )
+
+    return list(dict.fromkeys(candidates))
+
+
+def _build_user_attachments_candidates(image_url: str) -> list[str]:
+    if not isinstance(image_url, str):
+        return []
+    try:
+        parsed = parse.urlparse(image_url)
+    except Exception:
+        return []
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    if host != "github.com" or not path.startswith("/user-attachments/assets/"):
+        return []
+    base = image_url.split("?", 1)[0]
+    return [
+        f"{base}?raw=1",
+        f"{base}?download=1",
+    ]
+
+
+def _build_image_fetch_candidates(image_url: str) -> list[str]:
+    candidates: list[str] = []
+    candidates.extend(_build_user_attachments_candidates(image_url))
+    candidates.extend(_build_repo_image_cdn_candidates(image_url))
+    candidates.append(image_url)
+    return list(dict.fromkeys(x for x in candidates if x))
+
+
+def _extract_event_image_urls(event_name: str, payload: Mapping) -> list[str]:
+    urls: list[str] = []
+    for text in _extract_mention_candidate_texts(event_name, payload):
+        urls.extend(_extract_image_urls_from_text(text))
+    return list(dict.fromkeys(urls))
+
+
+def _strip_image_markup(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    text = MARKDOWN_IMAGE_PATTERN.sub(" ", text)
+    text = HTML_IMAGE_SRC_PATTERN.sub(" ", text)
+    return text
+
+
+def _extract_sender_is_bot(payload: Mapping) -> bool:
+    def nested(node: Any, key: str) -> Mapping:
+        if not isinstance(node, Mapping):
+            return {}
+        value = node.get(key, {})
+        return value if isinstance(value, Mapping) else {}
+
+    def is_bot_user(node: Any) -> bool:
+        if not isinstance(node, Mapping):
+            return False
+        user_type = node.get("type")
+        if isinstance(user_type, str) and user_type.lower() == "bot":
+            return True
+        login = node.get("login")
+        return isinstance(login, str) and login.lower().endswith("[bot]")
+
+    if is_bot_user(payload.get("sender")):
+        return True
+    if is_bot_user(nested(payload, "comment").get("user")):
+        return True
+    if is_bot_user(nested(payload, "review").get("user")):
+        return True
+    if is_bot_user(nested(payload, "issue").get("user")):
+        return True
+    if is_bot_user(nested(payload, "pull_request").get("user")):
+        return True
+    if is_bot_user(nested(payload, "discussion").get("user")):
+        return True
+    return False
 
 
 def _extract_mentions_from_text(text: str) -> set[str]:
@@ -233,7 +442,11 @@ def _event_has_mention(event_name: str, payload: Mapping) -> bool:
 def _extract_text_after_mentions(text: str) -> str:
     if not isinstance(text, str):
         return ""
-    cleaned = MENTION_PATTERN.sub(" ", text)
+    cleaned = _strip_image_markup(text)
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return ""
+    cleaned = MENTION_PATTERN.sub(" ", cleaned)
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
     return "\n".join(lines).strip()
@@ -255,21 +468,47 @@ def _extract_user_message_text(
             after_mention = _extract_text_after_mentions(text)
             if after_mention:
                 return after_mention
+        return ""
 
     for text in candidates:
-        value = text.strip()
+        value = _strip_image_markup(text).strip()
         if value:
             return value
     return ""
 
 
-def _replace_event_message_text(event: GitHubAppMessageEvent, text: str) -> None:
+def _replace_event_message_text(
+    event: GitHubAppMessageEvent,
+    text: str,
+    image_local_paths: list[str] | None = None,
+    image_fallback_urls: list[str] | None = None,
+) -> None:
     value = (text or "").strip()
-    if not value:
+    local_paths = list(dict.fromkeys((image_local_paths or [])))
+    fallback_urls = list(dict.fromkeys((image_fallback_urls or [])))
+    components: list[Any] = []
+    if value:
+        components.append(Plain(text=value))
+    for file_path in local_paths:
+        if not file_path:
+            continue
+        try:
+            components.append(Image.fromFileSystem(file_path))
+        except Exception:
+            continue
+    if fallback_urls and not local_paths:
+        fallback_text = "\n".join(f"[Image URL] {u}" for u in fallback_urls)
+        if fallback_text:
+            components.append(Plain(text=fallback_text))
+            if not value:
+                value = fallback_text
+
+    if not components:
         return
+
     event.message_str = value
     event.message_obj.message_str = value
-    event.message_obj.message = [Plain(text=value)]
+    event.message_obj.message = components
 
 
 def _base64url(data: bytes) -> str:
@@ -346,6 +585,7 @@ def _stringify_github_error(data: Any) -> str:
         "wake_event_types": ["issues", "pull_request"],
         "wake_on_mentions": True,
         "mention_target_logins": [],
+        "ignore_bot_sender_events": True,
         "github_signature_validation": True,
         "github_delivery_cache_ttl_seconds": 900,
         "github_delivery_cache_max_entries": 10000,
@@ -385,6 +625,7 @@ class GitHubAppAdapter(Platform):
         self.wake_event_types: set[str] = set()
         self.wake_on_mentions = True
         self.mention_target_logins: set[str] = set()
+        self.ignore_bot_sender_events = True
         self.private_key_text = ""
         self._private_key_debug: dict[str, Any] = {}
         self._session_routes: dict[str, GitHubSessionRoute] = {}
@@ -408,11 +649,11 @@ class GitHubAppAdapter(Platform):
         session: MessageSesion,
         message_chain: MessageChain,
     ):
-        text = _make_message_chain_text(message_chain)
-        if text:
+        body = await _make_message_chain_github_body(message_chain)
+        if body:
             success, reason = await self._send_text_to_github(
                 session.session_id,
-                text,
+                body,
             )
             if success:
                 logger.info(
@@ -488,6 +729,10 @@ class GitHubAppAdapter(Platform):
         parsed = parse_github_event(event_name, payload)
         if not parsed:
             return {"status": "ignored", "reason": "unsupported_event"}, 200
+        if self.ignore_bot_sender_events and (
+            parsed.sender_is_bot or _extract_sender_is_bot(payload)
+        ):
+            return {"status": "ignored", "reason": "sender_is_bot"}, 200
 
         self._remember_session_route(parsed)
         event = self._build_message_event(parsed, payload, delivery_id)
@@ -508,11 +753,64 @@ class GitHubAppAdapter(Platform):
             payload,
             has_mention,
         )
-        if user_message_text:
-            _replace_event_message_text(event, user_message_text)
+        image_urls = _extract_event_image_urls(parsed.event_name, payload)
+        prefetch_access_token = ""
+        if image_urls and parsed.installation_id is not None:
+            prefetch_access_token = await self._get_installation_access_token(
+                parsed.installation_id
+            )
+        (
+            image_local_paths,
+            image_failed_urls,
+        ) = await self._materialize_inbound_image_urls(
+            image_urls,
+            prefetch_access_token,
+        )
+        rendered_image_urls: list[str] = []
+        if (
+            image_urls
+            and image_failed_urls
+            and prefetch_access_token
+            and parsed.repository
+        ):
+            rendered_image_urls = await self._fetch_rendered_image_urls_via_api(
+                parsed.event_name,
+                parsed.repository,
+                payload,
+                prefetch_access_token,
+            )
+            retry_urls = [
+                u for u in rendered_image_urls if u and u not in set(image_urls)
+            ]
+            if retry_urls:
+                api_ok_paths, api_failed_urls = await self._materialize_inbound_image_urls(
+                    retry_urls,
+                    prefetch_access_token,
+                )
+                image_local_paths.extend(api_ok_paths)
+                if not api_ok_paths:
+                    image_failed_urls.extend(api_failed_urls)
+            if image_local_paths:
+                image_failed_urls = []
+
+        image_local_paths = list(dict.fromkeys(image_local_paths))
+        image_failed_urls = list(dict.fromkeys(image_failed_urls))
+        if user_message_text or image_local_paths or image_failed_urls:
+            _replace_event_message_text(
+                event,
+                user_message_text,
+                image_local_paths,
+                image_failed_urls,
+            )
             event.set_extra("github_user_message", user_message_text)
+            event.set_extra("github_image_urls", image_urls)
+            event.set_extra("github_image_local_paths", image_local_paths)
+            event.set_extra("github_image_failed_urls", image_failed_urls)
+            event.set_extra("github_image_rendered_urls", rendered_image_urls)
 
         wake_by_event_type = parsed.event_name in self.wake_event_types
+        if self.wake_on_mentions and has_mention and not bot_mentioned:
+            wake_by_event_type = False
         wake_by_mention = self.wake_on_mentions and bot_mentioned
         event.set_extra("github_contains_mention", has_mention)
         event.set_extra("github_mentions", sorted(mentions))
@@ -527,6 +825,296 @@ class GitHubAppAdapter(Platform):
 
         self.commit_event(event)
         return {"status": "accepted"}, 200
+
+    async def _materialize_inbound_image_urls(
+        self,
+        image_urls: list[str],
+        access_token: str = "",
+    ) -> tuple[list[str], list[str]]:
+        if not image_urls:
+            return [], []
+
+        target_root = (
+            Path(get_astrbot_plugin_data_path())
+            / PLUGIN_ROOT_DIR
+            / "runtime"
+            / "inbound_images"
+        )
+        try:
+            target_root.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning(f"[GitHubApp] create inbound image dir failed: {exc}")
+            return [], list(dict.fromkeys(image_urls))
+
+        ok_paths: list[str] = []
+        failed_urls: list[str] = []
+        for image_url in list(dict.fromkeys(image_urls)):
+            attempts = _build_image_fetch_candidates(image_url)
+            last_err = ""
+            for candidate_url in attempts:
+                local_path, err = await asyncio.to_thread(
+                    self._download_image_to_local_file_sync,
+                    candidate_url,
+                    target_root,
+                    access_token,
+                )
+                if local_path:
+                    ok_paths.append(local_path)
+                    break
+                if err:
+                    last_err = f"{candidate_url} -> {err}"
+            else:
+                failed_urls.append(image_url)
+                if last_err:
+                    logger.warning(
+                        "[GitHubApp] inbound image prefetch failed: "
+                        f"url={image_url}, attempts={attempts}, last_err={last_err}"
+                    )
+
+        return ok_paths, failed_urls
+
+    async def _fetch_rendered_image_urls_via_api(
+        self,
+        event_name: str,
+        repo: str,
+        payload: Mapping,
+        access_token: str,
+    ) -> list[str]:
+        comment = payload.get("comment")
+        if not isinstance(comment, Mapping):
+            return []
+        comment_id = comment.get("id")
+        if not isinstance(comment_id, int):
+            return []
+
+        repo_path = parse.quote(repo, safe="/")
+        if event_name == "issue_comment":
+            url = f"{self.github_api_base_url}/repos/{repo_path}/issues/comments/{comment_id}"
+        elif event_name == "pull_request_review_comment":
+            url = f"{self.github_api_base_url}/repos/{repo_path}/pulls/comments/{comment_id}"
+        else:
+            return []
+
+        headers = {
+            "Accept": "application/vnd.github.full+json",
+            "Authorization": f"Bearer {access_token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        status, data = await self._request_json("GET", url, headers=headers, body=None)
+        if status != 200 or not isinstance(data, Mapping):
+            detail = _stringify_github_error(data)
+            logger.warning(
+                "[GitHubApp] fetch rendered comment failed: "
+                f"event={event_name}, repo={repo}, comment={comment_id}, "
+                f"status={status}, detail={detail}"
+            )
+            return []
+
+        texts: list[str] = []
+        for key in ("body_html", "body", "body_text"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.append(value)
+        urls: list[str] = []
+        for text in texts:
+            urls.extend(_extract_image_urls_from_text(text))
+        urls = list(dict.fromkeys(urls))
+        return urls
+
+    def _looks_like_image_payload(
+        self,
+        head_bytes: bytes,
+        content_type: str,
+        suffix: str,
+    ) -> bool:
+        if not head_bytes:
+            return False
+        ct = (content_type or "").lower()
+        head = head_bytes
+        head_lower = head[:1024].lower()
+
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            return True
+        if head.startswith(b"\xff\xd8\xff"):
+            return True
+        if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
+            return True
+        if len(head) >= 12 and head[0:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return True
+        if head.startswith(b"BM"):
+            return True
+        if b"<svg" in head_lower or head_lower.lstrip().startswith(b"<?xml"):
+            if suffix == ".svg" or "svg" in ct or ct.startswith("image/"):
+                return True
+        if ct.startswith("image/"):
+            return True
+        if "application/octet-stream" in ct and suffix in {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".gif",
+            ".webp",
+            ".bmp",
+            ".svg",
+        }:
+            return True
+        return False
+
+    def _download_image_to_local_file_sync(
+        self,
+        image_url: str,
+        target_root: Path,
+        access_token: str = "",
+    ) -> tuple[str, str]:
+        if not isinstance(image_url, str) or not image_url.startswith(
+            ("http://", "https://")
+        ):
+            return "", "invalid_url"
+
+        # Keep prefetch bounded to avoid blocking webhook processing too long.
+        max_bytes = 20 * 1024 * 1024
+        parsed_url = parse.urlparse(image_url)
+        parsed_suffix = Path(parsed_url.path).suffix.lower()
+        if parsed_suffix not in {
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".gif",
+            ".webp",
+            ".bmp",
+            ".svg",
+        }:
+            parsed_suffix = ""
+
+        host = (parsed_url.netloc or "").lower()
+        path = parsed_url.path or ""
+        is_user_attachments = (
+            host == "github.com" and path.startswith("/user-attachments/assets/")
+        )
+        header_profiles: list[tuple[str, dict[str, str]]] = [
+            ("urllib_default", {}),
+            ("curl_like", {"User-Agent": "curl/8.7.1", "Accept": "*/*"}),
+            (
+                "astrbot",
+                {
+                    "User-Agent": "AstrBot-GitHubApp-Adapter/1.0",
+                    "Accept": "image/*,*/*;q=0.8",
+                },
+            ),
+        ]
+
+        attempt_errors: list[str] = []
+        for profile_name, base_headers in header_profiles:
+            req_headers = dict(base_headers)
+            if access_token and (
+                (
+                    host.endswith("api.github.com")
+                    or host.endswith("raw.githubusercontent.com")
+                    or host.endswith("githubusercontent.com")
+                )
+                and not is_user_attachments
+            ):
+                req_headers["Authorization"] = f"Bearer {access_token}"
+
+            req = request.Request(
+                image_url,
+                headers=req_headers,
+                method="GET",
+            )
+            try:
+                with request.urlopen(req, timeout=self._http_timeout_seconds) as resp:
+                    content_type = str(resp.headers.get("Content-Type", "")).lower()
+                    suffix = parsed_suffix
+                    if not suffix:
+                        if "image/png" in content_type:
+                            suffix = ".png"
+                        elif "image/gif" in content_type:
+                            suffix = ".gif"
+                        elif "image/webp" in content_type:
+                            suffix = ".webp"
+                        elif "image/bmp" in content_type:
+                            suffix = ".bmp"
+                        elif "image/svg" in content_type:
+                            suffix = ".svg"
+                        elif "image/jpeg" in content_type or "image/jpg" in content_type:
+                            suffix = ".jpg"
+                        else:
+                            suffix = ".jpg"
+
+                    target_path = target_root / f"{uuid.uuid4().hex}{suffix}"
+                    total = 0
+                    head_bytes = b""
+                    too_large = False
+                    with target_path.open("wb") as wf:
+                        while True:
+                            chunk = resp.read(64 * 1024)
+                            if not chunk:
+                                break
+                            if len(head_bytes) < 4096:
+                                remain = 4096 - len(head_bytes)
+                                head_bytes += chunk[:remain]
+                            total += len(chunk)
+                            if total > max_bytes:
+                                try:
+                                    target_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                attempt_errors.append(
+                                    f"{profile_name}:image_too_large"
+                                )
+                                too_large = True
+                                break
+                            wf.write(chunk)
+                    if too_large:
+                        continue
+                    if total <= 0:
+                        try:
+                            target_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        attempt_errors.append(f"{profile_name}:empty_body")
+                        continue
+
+                    if not self._looks_like_image_payload(
+                        head_bytes,
+                        content_type,
+                        suffix,
+                    ):
+                        try:
+                            target_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        attempt_errors.append(
+                            f"{profile_name}:not_image:{content_type or 'unknown'}"
+                        )
+                        continue
+
+                    return str(target_path.resolve()), ""
+            except error.HTTPError as exc:
+                detail = ""
+                try:
+                    raw = exc.read(256)
+                    if raw:
+                        detail = (
+                            raw.decode("utf-8", errors="replace")
+                            .replace("\r", " ")
+                            .replace("\n", " ")
+                            .strip()
+                        )
+                except Exception:
+                    detail = ""
+                if detail:
+                    attempt_errors.append(
+                        f"{profile_name}:http_{int(exc.code)}:{detail[:120]}"
+                    )
+                else:
+                    attempt_errors.append(f"{profile_name}:http_{int(exc.code)}")
+            except Exception as exc:
+                attempt_errors.append(f"{profile_name}:{type(exc).__name__}:{exc}")
+
+        if attempt_errors:
+            return "", " | ".join(attempt_errors[-4:])
+        return "", "download_failed"
 
     def _refresh_runtime_config(self) -> None:
         file_plugin_cfg = self._plugin_config_store.get()
@@ -572,6 +1160,13 @@ class GitHubAppAdapter(Platform):
         self.mention_target_logins = {
             login.lower() for login in mention_target_logins if login
         }
+        ignore_bot_sender_events = self.config.get("ignore_bot_sender_events")
+        if ignore_bot_sender_events is None:
+            ignore_bot_sender_events = plugin_cfg.get(
+                "default_ignore_bot_sender_events",
+                True,
+            )
+        self.ignore_bot_sender_events = bool(ignore_bot_sender_events)
 
         ttl_seconds = self.config.get(
             "github_delivery_cache_ttl_seconds",
@@ -615,6 +1210,7 @@ class GitHubAppAdapter(Platform):
             "effective_private_key_files": effective_private_key_files,
             "auto_discovered_private_key_paths": auto_discovered_private_key_paths,
             "mention_target_logins": sorted(self.mention_target_logins),
+            "ignore_bot_sender_events": self.ignore_bot_sender_events,
             "cached_app_slug": self._cached_app_slug,
             "plugin_config_keys": sorted(plugin_cfg.keys()),
             "file_plugin_config_keys": sorted(file_plugin_cfg.keys()),
@@ -987,6 +1583,7 @@ class GitHubAppAdapter(Platform):
         event.set_extra("github_action", parsed.action)
         event.set_extra("github_repository", parsed.repository)
         event.set_extra("github_session_id", parsed.session_id)
+        event.set_extra("github_sender_is_bot", parsed.sender_is_bot)
         if parsed.installation_id is not None:
             event.set_extra("github_installation_id", parsed.installation_id)
         return event

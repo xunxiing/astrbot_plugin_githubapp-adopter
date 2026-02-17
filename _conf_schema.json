@@ -35,6 +35,12 @@
     "hint": "Only wake on @mention when @login matches one of these values.",
     "default": []
   },
+  "default_ignore_bot_sender_events": {
+    "description": "Default ignore bot sender events",
+    "type": "bool",
+    "hint": "Ignore webhook events where sender.type is Bot.",
+    "default": true
+  },
   "enable_signature_validation": {
     "description": "启用签名校验",
     "type": "bool",

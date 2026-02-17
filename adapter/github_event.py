@@ -29,6 +29,7 @@ class GitHubParsedEvent:
     session_id: str
     sender_login: str
     sender_id: str
+    sender_is_bot: bool
     summary: str
     installation_id: int | None
     timestamp: int
@@ -108,6 +109,10 @@ def parse_github_event(event_name: str, payload: Mapping) -> GitHubParsedEvent |
         sender_id = str(sender_id)
     elif not isinstance(sender_id, str) or not sender_id:
         sender_id = sender_login
+    sender_type = sender.get("type")
+    sender_is_bot = isinstance(sender_type, str) and sender_type.lower() == "bot"
+    if not sender_is_bot and isinstance(sender_login, str):
+        sender_is_bot = sender_login.lower().endswith("[bot]")
 
     installation = _get_nested(payload, "installation")
     installation_id = installation.get("id")
@@ -129,6 +134,7 @@ def parse_github_event(event_name: str, payload: Mapping) -> GitHubParsedEvent |
         session_id=build_dynamic_session_id(event_name, payload),
         sender_login=sender_login,
         sender_id=sender_id,
+        sender_is_bot=sender_is_bot,
         summary=summary,
         installation_id=installation_id,
         timestamp=int(time.time()),
