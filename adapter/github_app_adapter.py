@@ -44,7 +44,7 @@ from .security import (
 )
 
 PLUGIN_ROOT_DIR = "astrbot_plugin_githubapp-adopter"
-ADAPTER_BUILD_MARK = "2026-02-17.15"
+ADAPTER_BUILD_MARK = "2026-02-17.16"
 MENTION_PATTERN = re.compile(r"(?<![A-Za-z0-9_])@[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 HTML_IMAGE_SRC_PATTERN = re.compile(
     r"""<img\b[^>]*\bsrc=["']([^"']+)["'][^>]*>""",
@@ -189,20 +189,14 @@ async def _resolve_image_component_url(component: Image) -> str:
     url = (component.url or component.file or "").strip()
     if url.startswith(("http://", "https://")):
         return url
-    try:
-        return await component.register_to_file_service()
-    except Exception:
-        return ""
+    return ""
 
 
 async def _resolve_file_component_url(component: File) -> str:
-    url = (component.url or "").strip()
+    url = (component.url or getattr(component, "file", "") or "").strip()
     if url.startswith(("http://", "https://")):
         return url
-    try:
-        return await component.register_to_file_service()
-    except Exception:
-        return ""
+    return ""
 
 
 def _normalize_pem_text(text: Any) -> str:
