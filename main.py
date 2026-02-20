@@ -1,10 +1,6 @@
 ﻿from __future__ import annotations
 
-import json
 import re
-import secrets
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -15,10 +11,17 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.config.default import CONFIG_METADATA_2, WEBHOOK_SUPPORTED_PLATFORMS
 from astrbot.core.skills.skill_manager import SkillManager
 from astrbot.core.utils.astrbot_path import get_astrbot_skills_path
+from .workflow.sandbox_workspace import (
+    build_shell_workspace_bootstrap_command,
+    normalize_repo_full_name,
+    sanitize_workspace_session_key,
+)
 
 GITHUB_ADAPTER_TYPE = "github_app"
-GITHUB_SKILL_TOOL_NAME = "github_app_issue_token"
-GITHUB_CREATE_LICENSE_PR_TOOL_NAME = "github_app_create_license_pr"
+GITHUB_CREATE_LICENSE_PR_TOOL_NAME = "github_create_license_pr"
+GITHUB_REPO_LS_TOOL_NAME = "github_repo_ls"
+GITHUB_REPO_READ_TOOL_NAME = "github_repo_read"
+GITHUB_REPO_SEARCH_TOOL_NAME = "github_repo_search"
 DEFAULT_GITHUB_SKILL_NAME = "github_app_ops"
 SUPPORTED_GITHUB_EVENTS = [
     "issues",
@@ -39,33 +42,13 @@ IMAGE_ATTACHMENT_PATH_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-PERMISSION_LEVEL_RANK = {"read": 1, "write": 2}
-DEFAULT_TOKEN_DEFAULT_PERMISSIONS: dict[str, str] = {
-    "contents": "read",
-    "pull_requests": "write",
-    "issues": "write",
-}
-DEFAULT_TOKEN_MAX_PERMISSIONS: dict[str, str] = {
-    "contents": "write",
-    "pull_requests": "write",
-    "issues": "write",
-}
-TOOL_GUARD_DEFAULT_PROTECTED_BRANCHES = ["main", "master"]
-DEFAULT_PRIVILEGED_SHELL_ALLOWLIST_PATTERNS = [
-    r"^\s*export\s+GH_TOKEN=.*$",
-    r"^\s*unset\s+GH_TOKEN\s*$",
-    r"^\s*Remove-Item\s+Env:GH_TOKEN\b.*$",
-    r"^\s*curl\b[\s\S]*api\.github\.com/repos/[^/\s]+/[^/\s]+/(branches/[^/\s]+|git/refs|contents/[^\"'\s]+|pulls|issues)\b[\s\S]*$",
-    r"^\s*gh\b[\s\S]*$",
-    r"^\s*git\b[\s\S]*$",
-]
-DEFAULT_PRIVILEGED_PYTHON_ALLOWLIST_PATTERNS: list[str] = []
 GITHUB_TOKEN_LITERAL_RE = re.compile(r"\bghs_[A-Za-z0-9_]{20,}\b")
-TOKEN_ALIAS_PREFIX = "gha_alias_"
-BRANCH_FIELD_RE = re.compile(
-    r"""["\\]?branch["\\]?\s*:\s*["\\]?([A-Za-z0-9._/\-]+)["\\]?""",
-    re.IGNORECASE,
-)
+GITHUB_ONLY_LLM_TOOLS = {
+    GITHUB_CREATE_LICENSE_PR_TOOL_NAME,
+    GITHUB_REPO_LS_TOOL_NAME,
+    GITHUB_REPO_READ_TOOL_NAME,
+    GITHUB_REPO_SEARCH_TOOL_NAME,
+}
 
 
 def set_runtime_plugin_config(config: dict | None) -> None:
@@ -114,250 +97,10 @@ async def _register_local_image_urls(local_paths: list[str]) -> list[str]:
     return list(dict.fromkeys(image_paths))
 
 
-def _parse_requested_permissions(value: Any) -> dict[str, str]:
-    if value is None:
-        return {}
-
-    parsed_map: Mapping[str, Any] | None = None
-    if isinstance(value, Mapping):
-        parsed_map = value
-    else:
-        raw = str(value).strip()
-        if not raw:
-            return {}
-        if raw.startswith("{") and raw.endswith("}"):
-            try:
-                obj = json.loads(raw)
-            except Exception:
-                return {}
-            if not isinstance(obj, Mapping):
-                return {}
-            parsed_map = obj
-        else:
-            parsed: dict[str, str] = {}
-            for item in re.split(r"[,\s]+", raw):
-                token = item.strip()
-                if not token or "=" not in token:
-                    continue
-                key, level = token.split("=", 1)
-                perm_name = key.strip()
-                perm_level = level.strip().lower()
-                if perm_name and perm_level in {"read", "write"}:
-                    parsed[perm_name] = perm_level
-            return parsed
-
-    normalized: dict[str, str] = {}
-    for key, raw_level in parsed_map.items():
-        perm_name = str(key).strip()
-        perm_level = str(raw_level).strip().lower()
-        if perm_name and perm_level in {"read", "write"}:
-            normalized[perm_name] = perm_level
-    return normalized
-
-
-def _normalize_repo_full_name(value: Any) -> str:
-    raw = str(value or "").strip().strip("/")
-    if "/" not in raw:
-        return ""
-    owner, repo = raw.split("/", 1)
-    owner = owner.strip().lower()
-    repo = repo.strip().lower()
-    if not owner or not repo:
-        return ""
-    return f"{owner}/{repo}"
-
-
-def _ensure_str_list(value: Any, fallback: list[str] | None = None) -> list[str]:
-    if not isinstance(value, list):
-        value = fallback or []
-    items: list[str] = []
-    for item in value:
-        text = str(item).strip()
-        if text:
-            items.append(text)
-    return list(dict.fromkeys(items))
-
-
-def _ensure_lower_str_list(value: Any, fallback: list[str] | None = None) -> list[str]:
-    if not isinstance(value, list):
-        value = fallback or []
-    items: list[str] = []
-    for item in value:
-        text = str(item).strip().lower()
-        if text:
-            items.append(text)
-    return list(dict.fromkeys(items))
-
-
-def _extract_branch_from_command_payload(command: str) -> str:
-    match = BRANCH_FIELD_RE.search(command)
-    if not match:
-        return ""
-    return str(match.group(1)).strip().lower()
-
-
 def _contains_github_token_literal(text: str) -> bool:
     if not text:
         return False
     return bool(GITHUB_TOKEN_LITERAL_RE.search(text))
-
-
-def _parse_expire_at_timestamp(value: Any) -> float:
-    now = time.time()
-    raw = str(value or "").strip()
-    if not raw:
-        return now + 3000
-    try:
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except Exception:
-        return now + 3000
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    ts = parsed.timestamp()
-    if ts <= now:
-        return now + 3000
-    return ts
-
-
-def _split_shell_segments(command: str) -> list[str]:
-    if not command:
-        return []
-    segments = re.split(r"(?:&&|\|\||[;|])", command)
-    return [str(seg).strip() for seg in segments if str(seg).strip()]
-
-
-def _matches_any_regex(text: str, patterns: list[str]) -> bool:
-    if not text:
-        return False
-    for pattern in patterns:
-        try:
-            if re.search(pattern, text, re.IGNORECASE | re.DOTALL):
-                return True
-        except re.error as exc:
-            logger.warning(f"[GitHubApp] invalid guard regex pattern: {pattern}, err={exc}")
-    return False
-
-
-def _find_shell_allowlist_violations(command: str, patterns: list[str]) -> list[str]:
-    violations: list[str] = []
-    for segment in _split_shell_segments(command):
-        if _matches_any_regex(segment, patterns):
-            continue
-        preview = segment.replace("\n", " ").replace("\r", " ").strip()
-        if len(preview) > 120:
-            preview = f"{preview[:117]}..."
-        violations.append(preview)
-    return violations
-
-
-def _detect_shell_guard_reasons(
-    command: str,
-    protected_branches: list[str],
-) -> list[str]:
-    if not command:
-        return []
-    reasons: list[str] = []
-    command_text = str(command)
-    command_lower = command_text.lower()
-
-    for branch in protected_branches:
-        if re.search(
-            rf"\bgit\s+push\b[^\n\r;&|]*\b{re.escape(branch)}\b",
-            command_text,
-            re.IGNORECASE,
-        ):
-            reasons.append(f"git_push_protected_branch:{branch}")
-        if re.search(rf"refs/heads/{re.escape(branch)}\b", command_lower):
-            reasons.append(f"write_protected_ref:{branch}")
-
-    touches_contents_api = "/contents/" in command_lower and bool(
-        re.search(r"\b-x\s+(put|patch|post)\b", command_text, re.IGNORECASE)
-    )
-    if touches_contents_api:
-        payload_branch = _extract_branch_from_command_payload(command_text)
-        if not payload_branch:
-            reasons.append("contents_write_without_explicit_branch")
-        elif payload_branch in protected_branches:
-            reasons.append(f"contents_write_protected_branch:{payload_branch}")
-
-    return list(dict.fromkeys(reasons))
-
-
-def _cap_permission_level(requested: str, max_level: str) -> str:
-    requested_rank = PERMISSION_LEVEL_RANK.get(str(requested).strip().lower(), 0)
-    max_rank = PERMISSION_LEVEL_RANK.get(str(max_level).strip().lower(), 0)
-    if requested_rank <= 0 or max_rank <= 0:
-        return ""
-    return "write" if min(requested_rank, max_rank) >= 2 else "read"
-
-
-def _build_effective_token_permissions(
-    repo: str,
-    requested: Mapping[str, str] | None,
-    config: Mapping[str, Any] | None,
-) -> tuple[dict[str, str], dict[str, Any]]:
-    cfg = dict(config or {})
-    policy_enabled = bool(cfg.get("force_token_permission_policy", True))
-    privileged_write_mode = bool(cfg.get("enable_privileged_write_mode", False))
-
-    default_permissions = _parse_requested_permissions(cfg.get("token_default_permissions"))
-    if not default_permissions:
-        default_permissions = dict(DEFAULT_TOKEN_DEFAULT_PERMISSIONS)
-
-    max_permissions = _parse_requested_permissions(cfg.get("token_max_permissions"))
-    if not max_permissions:
-        max_permissions = dict(DEFAULT_TOKEN_MAX_PERMISSIONS)
-
-    requested_map = (
-        {str(k): str(v) for k, v in requested.items()}
-        if isinstance(requested, Mapping)
-        else {}
-    )
-    base_permissions = dict(requested_map or default_permissions)
-    normalized_repo = _normalize_repo_full_name(repo)
-    notes: list[str] = []
-
-    if not policy_enabled:
-        effective = dict(base_permissions or default_permissions)
-        notes.append("policy_disabled")
-    else:
-        effective: dict[str, str] = {}
-        for perm_name, req_level in base_permissions.items():
-            name = str(perm_name).strip()
-            if not name:
-                continue
-            max_level = max_permissions.get(name)
-            if not max_level:
-                notes.append(f"{name}:dropped_not_in_max")
-                continue
-            capped_level = _cap_permission_level(str(req_level), str(max_level))
-            if not capped_level:
-                notes.append(f"{name}:invalid_level")
-                continue
-            req_level_text = str(req_level).strip().lower()
-            if capped_level != req_level_text:
-                notes.append(f"{name}:{req_level_text}->{capped_level}")
-            effective[name] = capped_level
-
-        if not effective:
-            effective = dict(default_permissions)
-            notes.append("fallback_default_permissions")
-
-    if effective.get("contents") == "write" and not privileged_write_mode:
-        effective["contents"] = "read"
-        notes.append("contents:write->read(privileged_write_mode_disabled)")
-
-    if not effective:
-        effective = dict(DEFAULT_TOKEN_DEFAULT_PERMISSIONS)
-        notes.append("fallback_builtin_defaults")
-
-    policy_snapshot = {
-        "policy_enabled": policy_enabled,
-        "privileged_write_mode_enabled": privileged_write_mode,
-        "repo": normalized_repo or str(repo or "").strip(),
-        "notes": notes,
-    }
-    return effective, policy_snapshot
 
 
 def _sanitize_skill_name(raw_name: Any) -> str:
@@ -396,25 +139,55 @@ def _extract_issue_number_from_github_session(session_id: str) -> int:
     return int(raw_number)
 
 
+def _extract_thread_meta_from_github_session(session_id: str) -> tuple[str, int | None]:
+    if not isinstance(session_id, str):
+        return "", None
+    parts = session_id.split(":", 3)
+    if len(parts) != 4:
+        return "", None
+    if parts[0] != "github":
+        return "", None
+    thread_type = str(parts[2]).strip()
+    raw_number = str(parts[3]).strip()
+    if raw_number.isdigit():
+        return thread_type, int(raw_number)
+    return thread_type, None
+
+
+def _build_workspace_path(
+    repo: str,
+    github_session_id: str,
+    workspace_root: str,
+) -> str:
+    normalized_repo = normalize_repo_full_name(repo)
+    if not normalized_repo:
+        return ""
+    owner, name = normalized_repo.split("/", 1)
+    root = str(workspace_root or "").strip() or "/tmp/github-workspaces"
+    root = root.rstrip("/")
+    session_key = sanitize_workspace_session_key(github_session_id)
+    return f"{root}/{owner}__{name}/{session_key}"
+
+
 def _build_github_skill_content(skill_name: str) -> str:
     return f"""---
-description: GitHub App operations skill. Use controlled PR tool first; token tool is legacy fallback.
+description: GitHub App operations skill. Use safe tools only.
 ---
 
 # {skill_name}
 
 ## Priority
 
-- For branch + commit + PR tasks, call `{GITHUB_CREATE_LICENSE_PR_TOOL_NAME}` first.
-- Use `{GITHUB_SKILL_TOOL_NAME}` only when explicit token workflow is required.
-- Never expose token in chat/log/repo files.
+- For add-license tasks, call `{GITHUB_CREATE_LICENSE_PR_TOOL_NAME}`.
+- For repository navigation, call `{GITHUB_REPO_LS_TOOL_NAME}` first.
+- For file content, call `{GITHUB_REPO_READ_TOOL_NAME}`.
+- For keyword lookup, call `{GITHUB_REPO_SEARCH_TOOL_NAME}`.
 
 ## Typical flow
 
 1. Resolve repo as `owner/repo`.
-2. If task is add-license-and-open-pr, use direct controlled tool.
-3. If custom operation is required, use token tool and keep token only in env var.
-4. Clear token env var after task.
+2. If task is add-license-and-open-pr, use license PR tool.
+3. For code questions, list directory first, then read files in chunks.
 """
 
 def _ensure_github_skill(config: Mapping[str, Any] | None) -> str:
@@ -534,73 +307,12 @@ class GitHubAppAdopterPlugin(Star):
     def __init__(self, context: Context, config: dict):
         super().__init__(context)
         self.config = config
-        self._token_alias_store: dict[str, dict[str, Any]] = {}
         skill_name = _ensure_github_skill(self.config)
         runtime_cfg = dict(self.config)
         runtime_cfg["effective_github_skill_name"] = skill_name
         set_runtime_plugin_config(runtime_cfg)
         _inject_platform_metadata()
         from .adapter.github_app_adapter import GitHubAppAdapter  # noqa: F401
-
-    def _cleanup_token_alias_store(self) -> None:
-        now = time.time()
-        stale_aliases = [
-            alias
-            for alias, payload in self._token_alias_store.items()
-            if float(payload.get("expire_at_ts", 0.0)) <= now
-            or not str(payload.get("token", ""))
-        ]
-        for alias in stale_aliases:
-            self._token_alias_store.pop(alias, None)
-
-    def _store_token_alias(self, token: str, expires_at: str) -> str:
-        self._cleanup_token_alias_store()
-        expire_at_ts = _parse_expire_at_timestamp(expires_at)
-        for _ in range(6):
-            alias = f"{TOKEN_ALIAS_PREFIX}{secrets.token_hex(16)}"
-            if alias not in self._token_alias_store:
-                self._token_alias_store[alias] = {
-                    "token": token,
-                    "expire_at_ts": expire_at_ts,
-                }
-                return alias
-        alias = f"{TOKEN_ALIAS_PREFIX}{int(time.time() * 1000)}"
-        self._token_alias_store[alias] = {
-            "token": token,
-            "expire_at_ts": expire_at_ts,
-        }
-        return alias
-
-    def _replace_alias_tokens_in_text(self, text: str) -> tuple[str, int]:
-        source = str(text or "")
-        if not source or TOKEN_ALIAS_PREFIX not in source:
-            return source, 0
-        self._cleanup_token_alias_store()
-        replaced_count = 0
-        resolved = source
-        for alias, payload in self._token_alias_store.items():
-            real_token = str(payload.get("token", ""))
-            if not real_token:
-                continue
-            if alias in resolved:
-                resolved = resolved.replace(alias, real_token)
-                replaced_count += 1
-        return resolved, replaced_count
-
-    def _replace_alias_tokens_in_env(
-        self, env_map: Mapping[str, Any]
-    ) -> tuple[dict[str, Any], int]:
-        resolved_env: dict[str, Any] = {}
-        replaced_count = 0
-        for raw_key, raw_value in env_map.items():
-            key = str(raw_key)
-            if isinstance(raw_value, str):
-                new_value, replaced = self._replace_alias_tokens_in_text(raw_value)
-                resolved_env[key] = new_value
-                replaced_count += replaced
-            else:
-                resolved_env[key] = raw_value
-        return resolved_env, replaced_count
 
     def _resolve_github_adapter(
         self,
@@ -623,6 +335,18 @@ class GitHubAppAdopterPlugin(Star):
         except Exception:
             return None
         return candidate
+
+    def _resolve_repo_from_event(self, event: AstrMessageEvent, repo: str) -> str:
+        repo_value = str(repo or "").strip()
+        if not repo_value:
+            repo_value = str(event.get_extra("github_repository", "")).strip()
+        if not repo_value:
+            repo_value = _extract_repo_from_github_session(
+                str(event.get_extra("github_session_id", "")).strip()
+            )
+        if not repo_value and event.get_platform_name() == GITHUB_ADAPTER_TYPE:
+            repo_value = _extract_repo_from_github_session(event.get_session_id())
+        return repo_value
 
     @filter.on_astrbot_loaded()
     async def on_astrbot_loaded(self):
@@ -649,83 +373,67 @@ class GitHubAppAdopterPlugin(Star):
         if tool_name not in {"astrbot_execute_shell", "astrbot_execute_python"}:
             return
 
-        enforce_guard = bool(cfg.get("enforce_tool_write_guard", True))
-        privileged_write_mode = bool(cfg.get("enable_privileged_write_mode", False))
-        privileged_require_whitelist = bool(
-            cfg.get("privileged_mode_require_whitelist", True)
-        )
-        shell_allowlist_patterns = _ensure_str_list(
-            cfg.get("privileged_mode_shell_allowlist_patterns"),
-            DEFAULT_PRIVILEGED_SHELL_ALLOWLIST_PATTERNS,
-        )
-        python_allowlist_patterns = _ensure_str_list(
-            cfg.get("privileged_mode_python_allowlist_patterns"),
-            DEFAULT_PRIVILEGED_PYTHON_ALLOWLIST_PATTERNS,
-        )
-        protected_branches = _ensure_lower_str_list(
-            cfg.get("guard_protected_branches"),
-            TOOL_GUARD_DEFAULT_PROTECTED_BRANCHES,
-        )
-        if not protected_branches:
-            protected_branches = list(TOOL_GUARD_DEFAULT_PROTECTED_BRANCHES)
+        if tool_name == "astrbot_execute_shell":
+            raw_command = str(tool_args.get("command", ""))
+            auto_prepare_workspace = bool(
+                cfg.get("enable_auto_sandbox_workspace_prepare", True)
+            )
+            if auto_prepare_workspace:
+                repo_value = str(event.get_extra("github_repository", "")).strip()
+                if not repo_value:
+                    repo_value = _extract_repo_from_github_session(
+                        str(event.get_extra("github_session_id", "")).strip()
+                    )
+                if not repo_value and event.get_platform_name() == GITHUB_ADAPTER_TYPE:
+                    repo_value = _extract_repo_from_github_session(event.get_session_id())
+
+                normalized_repo = normalize_repo_full_name(repo_value)
+                if normalized_repo:
+                    workspace_root = str(
+                        cfg.get("sandbox_workspace_root", "/tmp/github-workspaces")
+                    ).strip() or "/tmp/github-workspaces"
+                    try:
+                        clone_depth = int(cfg.get("sandbox_workspace_clone_depth", 1))
+                    except Exception:
+                        clone_depth = 1
+                    github_session_id = str(event.get_extra("github_session_id", "")).strip()
+                    if not github_session_id and event.get_platform_name() == GITHUB_ADAPTER_TYPE:
+                        github_session_id = event.get_session_id()
+                    session_key = sanitize_workspace_session_key(github_session_id)
+                    tool_args["command"] = build_shell_workspace_bootstrap_command(
+                        command=raw_command,
+                        repo=normalized_repo,
+                        session_key=session_key,
+                        workspace_root=workspace_root,
+                        clone_depth=clone_depth,
+                    )
+
+        enforce_guard = bool(cfg.get("enforce_tool_write_guard", False))
+        if not enforce_guard:
+            return
+
         block_token_literal = bool(cfg.get("guard_block_token_literal", True))
+        if not block_token_literal:
+            return
 
         reasons: list[str] = []
-        replaced_alias_count = 0
         if tool_name == "astrbot_execute_shell":
             command = str(tool_args.get("command", ""))
-            if enforce_guard:
-                if block_token_literal and _contains_github_token_literal(command):
-                    reasons.append("token_literal_in_shell_command")
-                reasons.extend(_detect_shell_guard_reasons(command, protected_branches))
-                if privileged_write_mode and privileged_require_whitelist:
-                    if not shell_allowlist_patterns:
-                        reasons.append("privileged_mode_shell_allowlist_empty")
-                    else:
-                        violations = _find_shell_allowlist_violations(
-                            command, shell_allowlist_patterns
-                        )
-                        if violations:
-                            reasons.append("shell_command_not_in_allowlist")
-                            reasons.append(f"shell_violation:{violations[0]}")
+            if _contains_github_token_literal(command):
+                reasons.append("token_literal_in_shell_command")
             if reasons:
                 reason_text = ",".join(list(dict.fromkeys(reasons)))
                 message = f"BLOCKED by github_app guard: {reason_text}"
                 safe_message = message.replace('"', "'").replace("\n", " ")
                 tool_args["command"] = f'echo "{safe_message}"'
-            else:
-                resolved_command, replaced = self._replace_alias_tokens_in_text(command)
-                tool_args["command"] = resolved_command
-                replaced_alias_count += replaced
         elif tool_name == "astrbot_execute_python":
             code = str(tool_args.get("code", ""))
-            if enforce_guard:
-                if block_token_literal and _contains_github_token_literal(code):
-                    reasons.append("token_literal_in_python_code")
-                if privileged_write_mode and privileged_require_whitelist:
-                    if not python_allowlist_patterns:
-                        reasons.append("privileged_mode_python_allowlist_empty")
-                    elif not _matches_any_regex(code, python_allowlist_patterns):
-                        reasons.append("python_code_not_in_allowlist")
+            if _contains_github_token_literal(code):
+                reasons.append("token_literal_in_python_code")
             if reasons:
                 reason_text = ",".join(list(dict.fromkeys(reasons)))
                 message = f"BLOCKED by github_app guard: {reason_text}"
                 tool_args["code"] = f"print({message!r})"
-            else:
-                resolved_code, replaced = self._replace_alias_tokens_in_text(code)
-                tool_args["code"] = resolved_code
-                replaced_alias_count += replaced
-
-        raw_env = tool_args.get("env")
-        if isinstance(raw_env, Mapping):
-            resolved_env, replaced = self._replace_alias_tokens_in_env(raw_env)
-            tool_args["env"] = resolved_env
-            replaced_alias_count += replaced
-
-        if replaced_alias_count:
-            logger.info(
-                f"[GitHubApp] replaced token alias in tool args: tool={tool_name}, count={replaced_alias_count}"
-            )
 
         if reasons:
             logger.warning(
@@ -733,7 +441,7 @@ class GitHubAppAdopterPlugin(Star):
             )
 
     @filter.llm_tool(name=GITHUB_CREATE_LICENSE_PR_TOOL_NAME)
-    async def github_app_create_license_pr(
+    async def github_create_license_pr(
         self,
         event: AstrMessageEvent,
         repo: str = "",
@@ -744,7 +452,20 @@ class GitHubAppAdopterPlugin(Star):
         pr_title: str = "",
         pr_body: str = "",
     ) -> str:
-        """受控工具：在仓库创建 LICENSE 并发起 PR，不向模型暴露 token。"""
+        """受控工具：在仓库创建 LICENSE 并发起 PR，不向模型暴露 token。
+
+        Args:
+            repo(string): 目标仓库，格式 owner/repo；为空时从当前 GitHub 会话自动解析。
+            issue_number(number): 可选，关联 issue 编号；<=0 时自动从会话解析。
+            platform_id(string): 可选，当存在多个 github_app 平台时可指定。
+            branch_name(string): 可选，目标分支名。
+            license_type(string): 许可证类型，当前仅支持 MIT。
+            pr_title(string): 可选，PR 标题。
+            pr_body(string): 可选，PR 描述。
+        """
+        if event.get_platform_name() != GITHUB_ADAPTER_TYPE:
+            return "该工具仅在 github_app 平台会话中可用。"
+
         runtime_cfg = get_runtime_plugin_config()
         if not bool(runtime_cfg.get("enable_direct_repo_write_tool", False)):
             return (
@@ -823,113 +544,269 @@ class GitHubAppAdopterPlugin(Star):
             lines.append("note: 已存在同分支 PR，本次返回已有 PR。")
         return "\n".join(lines)
 
-    @filter.llm_tool(name=GITHUB_SKILL_TOOL_NAME)
-    async def github_app_issue_token(
+    @filter.llm_tool(name=GITHUB_REPO_LS_TOOL_NAME)
+    async def github_repo_ls(
         self,
         event: AstrMessageEvent,
         repo: str = "",
-        session_id: str = "",
+        path: str = ".",
+        ref: str = "",
+        offset: int = 0,
+        limit: int = 50,
         platform_id: str = "",
-        permissions: str = "",
     ) -> str:
-        """签发短期 GitHub App Installation Token，用于仓库操作。
+        """列出仓库目录的一层文件列表（适合先浏览再深入）。
 
         Args:
-            repo(string): 目标仓库，格式 owner/repo。若事件上下文可推断可不传。
-            session_id(string): 可选，github 会话 ID，格式 github:owner/repo:type:number。
-            platform_id(string): 可选，存在多个 github_app 平台时指定平台 ID。
-            permissions(string): 可选，权限请求，支持 a=b,c=d 或 JSON（仅 read/write）。
+            repo(string): 目标仓库，格式 owner/repo；为空时从当前 GitHub 会话自动解析。
+            path(string): 目录路径，默认 "." 表示仓库根目录。
+            ref(string): 可选，分支/标签/提交；为空时使用默认分支。
+            offset(number): 可选，分页偏移，默认 0。
+            limit(number): 可选，分页大小，默认 50，最大 200。
+            platform_id(string): 可选，当存在多个 github_app 平台时可指定。
         """
-        runtime_cfg = get_runtime_plugin_config()
-        if not bool(runtime_cfg.get("enable_issue_token_tool", True)):
-            return (
-                "github_app_issue_token is disabled by config "
-                "(enable_issue_token_tool=false)."
-            )
+        if event.get_platform_name() != GITHUB_ADAPTER_TYPE:
+            return "该工具仅在 github_app 平台会话中可用。"
 
         adapter = self._resolve_github_adapter(event, platform_id)
         if adapter is None:
             return "未找到可用的 github_app 平台适配器。"
-        if not hasattr(adapter, "issue_installation_token_for_skill"):
-            return "当前 github_app 适配器不支持临时令牌签发，请升级插件。"
+        if not hasattr(adapter, "list_repo_dir_for_skill"):
+            return "当前 github_app 适配器不支持目录浏览工具，请升级插件。"
 
-        repo_value = str(repo or "").strip()
+        repo_value = self._resolve_repo_from_event(event, repo)
         if not repo_value:
-            repo_value = _extract_repo_from_github_session(str(session_id or "").strip())
-        if not repo_value:
-            repo_value = str(event.get_extra("github_repository", "")).strip()
-        if not repo_value:
-            repo_value = _extract_repo_from_github_session(
-                str(event.get_extra("github_session_id", "")).strip()
-            )
-        if not repo_value and event.get_platform_name() == GITHUB_ADAPTER_TYPE:
-            repo_value = _extract_repo_from_github_session(event.get_session_id())
+            return "无法解析 repo，请显式传入 owner/repo。"
 
-        requested_permissions = _parse_requested_permissions(permissions)
-        effective_permissions, permission_policy = _build_effective_token_permissions(
-            repo_value,
-            requested_permissions,
-            runtime_cfg,
-        )
-        ok, payload = await adapter.issue_installation_token_for_skill(
+        path_value = str(path or "").strip() or "."
+        ref_value = str(ref or "").strip()
+        try:
+            offset_value = max(0, int(offset or 0))
+        except Exception:
+            offset_value = 0
+        try:
+            limit_value = int(limit or 50)
+        except Exception:
+            limit_value = 50
+        limit_value = min(max(1, limit_value), 200)
+
+        ok, payload = await adapter.list_repo_dir_for_skill(
             repo=repo_value,
-            permissions=effective_permissions,
+            path=path_value,
+            ref=ref_value,
+            offset=offset_value,
+            limit=limit_value,
         )
         if not ok:
             detail = str(payload.get("error", "unknown error"))
-            return f"临时安装令牌签发失败：{detail}"
+            stage = str(payload.get("stage", "")).strip()
+            if stage:
+                return f"读取仓库目录失败（{stage}）：{detail}"
+            return f"读取仓库目录失败：{detail}"
 
-        token = str(payload.get("token", ""))
-        if not token:
-            return "临时安装令牌签发失败：返回了空令牌。"
+        entries = payload.get("entries", [])
+        if not isinstance(entries, list):
+            entries = []
+        resolved_path = str(payload.get("path", path_value)).strip()
+        resolved_ref = str(payload.get("ref", ref_value)).strip()
+        total = int(payload.get("total", len(entries)) or 0)
+        current_offset = int(payload.get("offset", offset_value) or 0)
+        current_limit = int(payload.get("limit", limit_value) or 0)
+        has_more = bool(payload.get("has_more", False))
 
-        expires_at = str(payload.get("expires_at", ""))
-        token_alias = self._store_token_alias(token, expires_at)
-        resolved_repo = str(payload.get("repo", repo_value))
-        installation_id = str(payload.get("installation_id", ""))
-        repository_selection = str(payload.get("repository_selection", ""))
-        granted_permissions = payload.get("permissions", {})
-        if not isinstance(granted_permissions, Mapping):
-            granted_permissions = {}
-        granted_permissions_text = json.dumps(
-            dict(granted_permissions),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        requested_permissions_text = json.dumps(
-            dict(requested_permissions),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        effective_permissions_text = json.dumps(
-            dict(effective_permissions),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
-        permission_policy_text = json.dumps(
-            dict(permission_policy),
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        lines = [
+            "仓库目录读取成功。",
+            f"repo: {repo_value}",
+            f"path: {resolved_path}",
+            f"ref: {resolved_ref or '(default)'}",
+            f"offset: {current_offset}",
+            f"limit: {current_limit}",
+            f"total: {total}",
+            "entries:",
+        ]
+        for idx, item in enumerate(entries, start=current_offset + 1):
+            if not isinstance(item, Mapping):
+                continue
+            item_type = str(item.get("type", "")).strip().lower()
+            item_name = str(item.get("name", "")).strip()
+            item_path = str(item.get("path", "")).strip()
+            item_size = int(item.get("size", 0) or 0)
+            mark = "DIR" if item_type == "dir" else "FILE"
+            lines.append(f"{idx}. [{mark}] {item_name} ({item_size} bytes) path={item_path}")
+        if has_more:
+            lines.append("note: 结果未展示完，继续调用 github_repo_ls 并增大 offset。")
+        return "\n".join(lines)
 
-        return "\n".join(
-            [
-                "GitHub App 临时安装令牌签发成功。",
-                f"repo: {resolved_repo}",
-                f"installation_id: {installation_id}",
-                f"expires_at: {expires_at}",
-                f"repository_selection: {repository_selection}",
-                f"requested_permissions: {requested_permissions_text}",
-                f"effective_permissions: {effective_permissions_text}",
-                f"granted_permissions: {granted_permissions_text}",
-                f"permission_policy: {permission_policy_text}",
-                "token_is_alias: true",
-                f"token: {token_alias}",
-                "PowerShell 设置令牌：$env:GH_TOKEN='<token>'",
-                "Bash 设置令牌：export GH_TOKEN='<token>'",
-                "使用后请立即清理（PowerShell: Remove-Item Env:GH_TOKEN；Bash: unset GH_TOKEN）。",
-            ]
+    @filter.llm_tool(name=GITHUB_REPO_READ_TOOL_NAME)
+    async def github_repo_read(
+        self,
+        event: AstrMessageEvent,
+        repo: str = "",
+        path: str = "",
+        ref: str = "",
+        start_line: int = 1,
+        max_lines: int = 200,
+        platform_id: str = "",
+    ) -> str:
+        """按行读取仓库文件内容（大文件建议分段读取）。
+
+        Args:
+            repo(string): 目标仓库，格式 owner/repo；为空时从当前 GitHub 会话自动解析。
+            path(string): 文件路径，例如 README.md 或 src/main.py。
+            ref(string): 可选，分支/标签/提交；为空时使用默认分支。
+            start_line(number): 起始行号（1-based），默认 1。
+            max_lines(number): 读取行数，默认 200，最大 400。
+            platform_id(string): 可选，当存在多个 github_app 平台时可指定。
+        """
+        if event.get_platform_name() != GITHUB_ADAPTER_TYPE:
+            return "该工具仅在 github_app 平台会话中可用。"
+
+        adapter = self._resolve_github_adapter(event, platform_id)
+        if adapter is None:
+            return "未找到可用的 github_app 平台适配器。"
+        if not hasattr(adapter, "read_repo_file_for_skill"):
+            return "当前 github_app 适配器不支持文件读取工具，请升级插件。"
+
+        repo_value = self._resolve_repo_from_event(event, repo)
+        if not repo_value:
+            return "无法解析 repo，请显式传入 owner/repo。"
+
+        path_value = str(path or "").strip()
+        if not path_value:
+            return "缺少 path 参数，请传入文件路径。"
+        ref_value = str(ref or "").strip()
+        try:
+            start_value = max(1, int(start_line or 1))
+        except Exception:
+            start_value = 1
+        try:
+            max_lines_value = int(max_lines or 200)
+        except Exception:
+            max_lines_value = 200
+        max_lines_value = min(max(1, max_lines_value), 400)
+
+        ok, payload = await adapter.read_repo_file_for_skill(
+            repo=repo_value,
+            path=path_value,
+            ref=ref_value,
+            start_line=start_value,
+            max_lines=max_lines_value,
         )
+        if not ok:
+            detail = str(payload.get("error", "unknown error"))
+            stage = str(payload.get("stage", "")).strip()
+            if stage:
+                return f"读取仓库文件失败（{stage}）：{detail}"
+            return f"读取仓库文件失败：{detail}"
+
+        resolved_path = str(payload.get("path", path_value)).strip()
+        resolved_ref = str(payload.get("ref", ref_value)).strip()
+        sha = str(payload.get("sha", "")).strip()
+        size = int(payload.get("size", 0) or 0)
+        line_start = int(payload.get("line_start", start_value) or start_value)
+        line_end = int(payload.get("line_end", line_start) or line_start)
+        total_lines = int(payload.get("total_lines", 0) or 0)
+        has_more = bool(payload.get("has_more", False))
+        next_start_line = int(payload.get("next_start_line", line_end + 1) or (line_end + 1))
+        content = str(payload.get("content", ""))
+
+        lines = [
+            "仓库文件读取成功。",
+            f"repo: {repo_value}",
+            f"path: {resolved_path}",
+            f"ref: {resolved_ref or '(default)'}",
+            f"sha: {sha}",
+            f"size: {size}",
+            f"line_range: {line_start}-{line_end}",
+            f"total_lines: {total_lines}",
+            f"has_more: {str(has_more).lower()}",
+        ]
+        if has_more:
+            lines.append(f"next_start_line: {next_start_line}")
+        lines.append("content:")
+        lines.append(content)
+        return "\n".join(lines)
+
+    @filter.llm_tool(name=GITHUB_REPO_SEARCH_TOOL_NAME)
+    async def github_repo_search(
+        self,
+        event: AstrMessageEvent,
+        repo: str = "",
+        query: str = "",
+        path: str = "",
+        limit: int = 20,
+        platform_id: str = "",
+    ) -> str:
+        """在仓库内按关键字搜索代码路径与片段。
+
+        Args:
+            repo(string): 目标仓库，格式 owner/repo；为空时从当前 GitHub 会话自动解析。
+            query(string): 搜索关键词。
+            path(string): 可选，限制在某个目录路径下搜索。
+            limit(number): 可选，返回条数，默认 20，最大 50。
+            platform_id(string): 可选，当存在多个 github_app 平台时可指定。
+        """
+        if event.get_platform_name() != GITHUB_ADAPTER_TYPE:
+            return "该工具仅在 github_app 平台会话中可用。"
+
+        adapter = self._resolve_github_adapter(event, platform_id)
+        if adapter is None:
+            return "未找到可用的 github_app 平台适配器。"
+        if not hasattr(adapter, "search_repo_code_for_skill"):
+            return "当前 github_app 适配器不支持仓库搜索工具，请升级插件。"
+
+        repo_value = self._resolve_repo_from_event(event, repo)
+        if not repo_value:
+            return "无法解析 repo，请显式传入 owner/repo。"
+
+        query_value = str(query or "").strip()
+        if not query_value:
+            return "缺少 query 参数，请提供搜索关键词。"
+        path_value = str(path or "").strip()
+        try:
+            limit_value = int(limit or 20)
+        except Exception:
+            limit_value = 20
+        limit_value = min(max(1, limit_value), 50)
+
+        ok, payload = await adapter.search_repo_code_for_skill(
+            repo=repo_value,
+            query=query_value,
+            path=path_value,
+            limit=limit_value,
+        )
+        if not ok:
+            detail = str(payload.get("error", "unknown error"))
+            stage = str(payload.get("stage", "")).strip()
+            if stage:
+                return f"仓库搜索失败（{stage}）：{detail}"
+            return f"仓库搜索失败：{detail}"
+
+        hits = payload.get("hits", [])
+        if not isinstance(hits, list):
+            hits = []
+        total_count = int(payload.get("total_count", len(hits)) or 0)
+        incomplete = bool(payload.get("incomplete_results", False))
+        lines = [
+            "仓库代码搜索成功。",
+            f"repo: {repo_value}",
+            f"query: {query_value}",
+            f"path_filter: {path_value or '(none)'}",
+            f"total_count: {total_count}",
+            f"returned: {len(hits)}",
+            f"incomplete_results: {str(incomplete).lower()}",
+            "hits:",
+        ]
+        for idx, hit in enumerate(hits, start=1):
+            if not isinstance(hit, Mapping):
+                continue
+            hit_path = str(hit.get("path", "")).strip()
+            score = float(hit.get("score", 0.0) or 0.0)
+            snippet = str(hit.get("snippet", "")).strip()
+            lines.append(f"{idx}. {hit_path} (score={score:.2f})")
+            if snippet:
+                lines.append(f"   snippet: {snippet}")
+        return "\n".join(lines)
 
     @filter.on_llm_request(priority=-20000)
     async def fix_github_image_llm_request(
@@ -937,8 +814,73 @@ class GitHubAppAdopterPlugin(Star):
         event: AstrMessageEvent,
         req: ProviderRequest,
     ):
+        func_tool = req.func_tool
+        if func_tool is not None and event.get_platform_name() != GITHUB_ADAPTER_TYPE:
+            for tool_name in GITHUB_ONLY_LLM_TOOLS:
+                try:
+                    func_tool.remove_tool(tool_name)
+                except Exception:
+                    pass
+
         if event.get_platform_name() != GITHUB_ADAPTER_TYPE:
             return
+
+        cfg = get_runtime_plugin_config()
+        repo_value = str(event.get_extra("github_repository", "")).strip()
+        github_session_id = str(event.get_extra("github_session_id", "")).strip()
+        if not github_session_id:
+            github_session_id = event.get_session_id()
+        if not repo_value:
+            repo_value = _extract_repo_from_github_session(github_session_id)
+
+        thread_type = str(event.get_extra("github_thread_type", "")).strip()
+        thread_number_raw = str(event.get_extra("github_thread_number", "")).strip()
+        thread_number = int(thread_number_raw) if thread_number_raw.isdigit() else None
+        if not thread_type:
+            parsed_type, parsed_num = _extract_thread_meta_from_github_session(
+                github_session_id
+            )
+            thread_type = parsed_type
+            if thread_number is None:
+                thread_number = parsed_num
+
+        thread_title = str(event.get_extra("github_thread_title", "")).strip()
+        thread_url = str(event.get_extra("github_thread_url", "")).strip()
+        workspace_hint = ""
+        if bool(cfg.get("enable_auto_sandbox_workspace_prepare", True)) and repo_value:
+            workspace_root = str(
+                cfg.get("sandbox_workspace_root", "/tmp/github-workspaces")
+            ).strip() or "/tmp/github-workspaces"
+            workspace_hint = _build_workspace_path(
+                repo=repo_value,
+                github_session_id=github_session_id,
+                workspace_root=workspace_root,
+            )
+
+        context_lines = [
+            "[GitHub Session Context]",
+            f"- repository: {repo_value or '(unknown)'}",
+            f"- session_id: {github_session_id or '(unknown)'}",
+        ]
+        if thread_type:
+            context_lines.append(f"- thread_type: {thread_type}")
+        if thread_number is not None:
+            context_lines.append(f"- thread_number: {thread_number}")
+        if thread_title:
+            context_lines.append(f"- thread_title: {thread_title}")
+        if thread_url:
+            context_lines.append(f"- thread_url: {thread_url}")
+        if workspace_hint:
+            context_lines.append(f"- sandbox_workspace: {workspace_hint}")
+            context_lines.append(
+                "- note: shell tools will auto-cd to this workspace and auto-clone repo if missing."
+            )
+        context_lines.append(
+            "- instruction: for repository file/code questions, use github_repo_ls first, then github_repo_read / github_repo_search."
+        )
+        context_block = "\n".join(context_lines).strip()
+        if context_block and context_block not in req.system_prompt:
+            req.system_prompt = f"{req.system_prompt}\n{context_block}".strip()
 
         local_paths = _ensure_path_list(event.get_extra("github_image_local_paths", []))
         failed_urls = _ensure_http_url_list(event.get_extra("github_image_failed_urls", []))

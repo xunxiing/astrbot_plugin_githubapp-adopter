@@ -526,6 +526,28 @@ def _parse_session_route(
     )
 
 
+def _extract_thread_title_from_payload(payload: Mapping) -> str:
+    for key in ("issue", "pull_request", "discussion"):
+        node = payload.get(key)
+        if not isinstance(node, Mapping):
+            continue
+        title = node.get("title")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+    return ""
+
+
+def _extract_thread_url_from_payload(payload: Mapping) -> str:
+    for key in ("issue", "pull_request", "discussion"):
+        node = payload.get(key)
+        if not isinstance(node, Mapping):
+            continue
+        html_url = node.get("html_url")
+        if isinstance(html_url, str) and html_url.strip():
+            return html_url.strip()
+    return ""
+
+
 def _normalize_repo_full_name(value: Any) -> str:
     if not isinstance(value, str):
         return ""
@@ -1334,67 +1356,6 @@ class GitHubAppAdapter(Platform):
             return slug.strip().lower()
         return ""
 
-    async def issue_installation_token_for_skill(
-        self,
-        *,
-        repo: str = "",
-        installation_id: int | None = None,
-        permissions: Mapping[str, str] | None = None,
-        repositories: list[str] | None = None,
-    ) -> tuple[bool, dict[str, Any]]:
-        self._refresh_runtime_config()
-        if not self.github_app_id:
-            return False, {"error": "github_app_id is empty"}
-        if not self.private_key_text:
-            return False, {"error": "private key is empty or invalid"}
-
-        resolved_repo = _normalize_repo_full_name(repo)
-        resolved_installation_id = (
-            int(installation_id) if isinstance(installation_id, int) else None
-        )
-        if resolved_installation_id is None:
-            if not resolved_repo:
-                return False, {
-                    "error": "repo is required when installation_id is not provided"
-                }
-            resolved_installation_id = await self._resolve_installation_id(resolved_repo)
-            if resolved_installation_id is None:
-                return (
-                    False,
-                    {
-                        "error": f"installation id not found for repo={resolved_repo}",
-                    },
-                )
-
-        token_data = await self._create_installation_access_token(
-            resolved_installation_id,
-            permissions=permissions,
-            repositories=repositories,
-            use_cache=False,
-        )
-        token = token_data.get("token")
-        if not isinstance(token, str) or not token:
-            detail = str(token_data.get("error", "failed to get installation access token"))
-            return False, {"error": detail}
-
-        expires_epoch = float(token_data.get("expires_at_epoch", 0.0) or 0.0)
-        expires_in = int(expires_epoch - time.time()) if expires_epoch > 0 else 0
-        if expires_in < 0:
-            expires_in = 0
-
-        return (
-            True,
-            {
-                "token": token,
-                "expires_at": str(token_data.get("expires_at", "")),
-                "expires_in_seconds": expires_in,
-                "installation_id": resolved_installation_id,
-                "repo": resolved_repo,
-                "repository_selection": token_data.get("repository_selection"),
-                "permissions": token_data.get("permissions"),
-            },
-        )
-
     def _sanitize_branch_name_for_skill(self, branch_name: str) -> str:
         raw = str(branch_name or "").strip()
         if not raw:
@@ -1408,6 +1369,29 @@ class GitHubAppAdapter(Platform):
         if not re.fullmatch(r"[A-Za-z0-9._/\-]+", cleaned):
             return "bot/add-license"
         return cleaned
+
+    def _sanitize_repo_path_for_skill(self, file_path: str) -> str:
+        raw = str(file_path or "").strip().replace("\\", "/")
+        if raw in {"", ".", "/"}:
+            return ""
+        raw = raw.lstrip("/")
+        if not raw or raw == ".":
+            return ""
+        if raw.startswith(".git/") or raw == ".git":
+            return ""
+        if "\x00" in raw:
+            return ""
+        parts: list[str] = []
+        for part in raw.split("/"):
+            p = part.strip()
+            if not p or p == ".":
+                continue
+            if p == "..":
+                return ""
+            parts.append(p)
+        if not parts:
+            return ""
+        return "/".join(parts)
 
     def _build_mit_license_text_for_skill(self, owner: str) -> str:
         year = datetime.utcnow().year
@@ -1621,6 +1605,352 @@ class GitHubAppAdapter(Platform):
             "repo": normalized_repo,
             "base_branch": default_branch,
             "head_branch": target_branch,
+        }
+
+    async def list_repo_dir_for_skill(
+        self,
+        *,
+        repo: str,
+        path: str = ".",
+        ref: str = "",
+        offset: int = 0,
+        limit: int = 50,
+    ) -> tuple[bool, dict[str, Any]]:
+        self._refresh_runtime_config()
+        if not self.github_app_id:
+            return False, {"error": "github_app_id is empty"}
+        if not self.private_key_text:
+            return False, {"error": "private key is empty or invalid"}
+
+        normalized_repo = _normalize_repo_full_name(repo)
+        if not normalized_repo:
+            return False, {"error": "invalid repo, expected owner/repo"}
+
+        raw_path = str(path or "").strip()
+        normalized_path = self._sanitize_repo_path_for_skill(raw_path)
+        if raw_path and not normalized_path and raw_path not in {".", "/"}:
+            return False, {"error": "invalid path", "stage": "validate_path"}
+
+        installation_id = await self._resolve_installation_id(normalized_repo)
+        if installation_id is None:
+            return False, {"error": f"installation id not found for repo={normalized_repo}"}
+
+        token_data = await self._create_installation_access_token(
+            installation_id,
+            permissions={"contents": "read"},
+            repositories=None,
+            use_cache=False,
+        )
+        access_token = str(token_data.get("token", ""))
+        if not access_token:
+            detail = str(token_data.get("error", "failed to get installation token"))
+            return False, {"error": detail, "stage": "issue_token"}
+
+        repo_path = parse.quote(normalized_repo, safe="/")
+        encoded_path = parse.quote(normalized_path, safe="/")
+        ref_value = str(ref or "").strip()
+        ref_query = f"?ref={parse.quote(ref_value, safe='')}" if ref_value else ""
+        if encoded_path:
+            contents_url = (
+                f"{self.github_api_base_url}/repos/{repo_path}/contents/{encoded_path}{ref_query}"
+            )
+        else:
+            contents_url = f"{self.github_api_base_url}/repos/{repo_path}/contents{ref_query}"
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {access_token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        status, data = await self._request_json(
+            "GET",
+            contents_url,
+            headers=headers,
+            body=None,
+        )
+        if status != 200:
+            return False, {
+                "error": f"list repo dir failed: status={status}, detail={_stringify_github_error(data)}",
+                "stage": "list_repo_dir",
+            }
+        if isinstance(data, Mapping):
+            node_type = str(data.get("type", "")).strip().lower()
+            if node_type == "file":
+                return False, {"error": "target path is a file, not a directory", "stage": "list_repo_dir"}
+            return False, {"error": f"unsupported node type: {node_type or 'unknown'}", "stage": "list_repo_dir"}
+        if not isinstance(data, list):
+            return False, {"error": "unexpected response type for directory", "stage": "list_repo_dir"}
+
+        entries: list[dict[str, Any]] = []
+        for item in data:
+            if not isinstance(item, Mapping):
+                continue
+            item_type = str(item.get("type", "")).strip().lower()
+            item_name = str(item.get("name", "")).strip()
+            item_path = str(item.get("path", "")).strip()
+            item_size = int(item.get("size", 0) or 0)
+            if not item_name or not item_path:
+                continue
+            entries.append(
+                {
+                    "type": item_type,
+                    "name": item_name,
+                    "path": item_path,
+                    "size": item_size,
+                }
+            )
+
+        entries.sort(
+            key=lambda e: (
+                0 if str(e.get("type", "")).lower() == "dir" else 1,
+                str(e.get("name", "")).lower(),
+            )
+        )
+        total = len(entries)
+        try:
+            offset_value = max(0, int(offset or 0))
+        except Exception:
+            offset_value = 0
+        try:
+            limit_value = int(limit or 50)
+        except Exception:
+            limit_value = 50
+        limit_value = min(max(1, limit_value), 200)
+        paged_entries = entries[offset_value : offset_value + limit_value]
+        has_more = (offset_value + limit_value) < total
+
+        return True, {
+            "repo": normalized_repo,
+            "path": normalized_path or ".",
+            "ref": ref_value,
+            "offset": offset_value,
+            "limit": limit_value,
+            "total": total,
+            "has_more": has_more,
+            "entries": paged_entries,
+        }
+
+    async def read_repo_file_for_skill(
+        self,
+        *,
+        repo: str,
+        path: str,
+        ref: str = "",
+        start_line: int = 1,
+        max_lines: int = 200,
+    ) -> tuple[bool, dict[str, Any]]:
+        self._refresh_runtime_config()
+        if not self.github_app_id:
+            return False, {"error": "github_app_id is empty"}
+        if not self.private_key_text:
+            return False, {"error": "private key is empty or invalid"}
+
+        normalized_repo = _normalize_repo_full_name(repo)
+        if not normalized_repo:
+            return False, {"error": "invalid repo, expected owner/repo"}
+
+        raw_path = str(path or "").strip()
+        normalized_path = self._sanitize_repo_path_for_skill(raw_path)
+        if not normalized_path:
+            return False, {"error": "invalid file path", "stage": "validate_path"}
+
+        installation_id = await self._resolve_installation_id(normalized_repo)
+        if installation_id is None:
+            return False, {"error": f"installation id not found for repo={normalized_repo}"}
+
+        token_data = await self._create_installation_access_token(
+            installation_id,
+            permissions={"contents": "read"},
+            repositories=None,
+            use_cache=False,
+        )
+        access_token = str(token_data.get("token", ""))
+        if not access_token:
+            detail = str(token_data.get("error", "failed to get installation token"))
+            return False, {"error": detail, "stage": "issue_token"}
+
+        repo_path = parse.quote(normalized_repo, safe="/")
+        encoded_path = parse.quote(normalized_path, safe="/")
+        ref_value = str(ref or "").strip()
+        ref_query = f"?ref={parse.quote(ref_value, safe='')}" if ref_value else ""
+        contents_url = f"{self.github_api_base_url}/repos/{repo_path}/contents/{encoded_path}{ref_query}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {access_token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        status, data = await self._request_json(
+            "GET",
+            contents_url,
+            headers=headers,
+            body=None,
+        )
+        if status != 200:
+            return False, {
+                "error": f"read repo file failed: status={status}, detail={_stringify_github_error(data)}",
+                "stage": "read_repo_file",
+            }
+        if not isinstance(data, Mapping):
+            return False, {"error": "unexpected response type for file", "stage": "read_repo_file"}
+
+        node_type = str(data.get("type", "")).strip().lower()
+        if node_type != "file":
+            return False, {"error": "target path is not a file", "stage": "read_repo_file"}
+
+        encoding = str(data.get("encoding", "")).strip().lower()
+        raw_content = data.get("content", "")
+        if not isinstance(raw_content, str):
+            raw_content = ""
+        if encoding == "base64":
+            try:
+                full_content = base64.b64decode(raw_content, validate=False).decode(
+                    "utf-8", errors="replace"
+                )
+            except Exception:
+                return False, {"error": "failed to decode base64 content", "stage": "decode_content"}
+        else:
+            full_content = raw_content
+
+        lines = full_content.splitlines()
+        total_lines = len(lines)
+        try:
+            start_value = max(1, int(start_line or 1))
+        except Exception:
+            start_value = 1
+        try:
+            max_lines_value = int(max_lines or 200)
+        except Exception:
+            max_lines_value = 200
+        max_lines_value = min(max(1, max_lines_value), 400)
+
+        begin_idx = min(start_value - 1, total_lines)
+        end_idx = min(begin_idx + max_lines_value, total_lines)
+        selected = lines[begin_idx:end_idx]
+        numbered = [
+            f"{line_no:>6}: {text}"
+            for line_no, text in enumerate(selected, start=begin_idx + 1)
+        ]
+        content = "\n".join(numbered)
+        has_more = end_idx < total_lines
+
+        return True, {
+            "repo": normalized_repo,
+            "path": normalized_path,
+            "ref": ref_value,
+            "sha": str(data.get("sha", "")).strip(),
+            "size": int(data.get("size", 0) or 0),
+            "line_start": begin_idx + 1 if total_lines > 0 else 0,
+            "line_end": end_idx if total_lines > 0 else 0,
+            "total_lines": total_lines,
+            "has_more": has_more,
+            "next_start_line": end_idx + 1,
+            "content": content,
+        }
+
+    async def search_repo_code_for_skill(
+        self,
+        *,
+        repo: str,
+        query: str,
+        path: str = "",
+        limit: int = 20,
+    ) -> tuple[bool, dict[str, Any]]:
+        self._refresh_runtime_config()
+        if not self.github_app_id:
+            return False, {"error": "github_app_id is empty"}
+        if not self.private_key_text:
+            return False, {"error": "private key is empty or invalid"}
+
+        normalized_repo = _normalize_repo_full_name(repo)
+        if not normalized_repo:
+            return False, {"error": "invalid repo, expected owner/repo"}
+        query_value = str(query or "").strip()
+        if not query_value:
+            return False, {"error": "query is required", "stage": "validate_query"}
+
+        raw_path = str(path or "").strip()
+        normalized_path = self._sanitize_repo_path_for_skill(raw_path)
+        if raw_path and not normalized_path and raw_path not in {".", "/"}:
+            return False, {"error": "invalid path filter", "stage": "validate_path"}
+
+        installation_id = await self._resolve_installation_id(normalized_repo)
+        if installation_id is None:
+            return False, {"error": f"installation id not found for repo={normalized_repo}"}
+
+        token_data = await self._create_installation_access_token(
+            installation_id,
+            permissions={"contents": "read"},
+            repositories=None,
+            use_cache=False,
+        )
+        access_token = str(token_data.get("token", ""))
+        if not access_token:
+            detail = str(token_data.get("error", "failed to get installation token"))
+            return False, {"error": detail, "stage": "issue_token"}
+
+        try:
+            per_page = int(limit or 20)
+        except Exception:
+            per_page = 20
+        per_page = min(max(1, per_page), 50)
+        search_query = f"{query_value} repo:{normalized_repo} in:file"
+        if normalized_path:
+            search_query = f"{search_query} path:{normalized_path}"
+        params = parse.urlencode({"q": search_query, "per_page": str(per_page)})
+        url = f"{self.github_api_base_url}/search/code?{params}"
+        headers = {
+            "Accept": "application/vnd.github.text-match+json",
+            "Authorization": f"Bearer {access_token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        status, data = await self._request_json("GET", url, headers=headers, body=None)
+        if status != 200 or not isinstance(data, Mapping):
+            return False, {
+                "error": f"search code failed: status={status}, detail={_stringify_github_error(data)}",
+                "stage": "search_code",
+            }
+
+        items = data.get("items", [])
+        if not isinstance(items, list):
+            items = []
+        hits: list[dict[str, Any]] = []
+        for item in items[:per_page]:
+            if not isinstance(item, Mapping):
+                continue
+            item_path = str(item.get("path", "")).strip()
+            html_url = str(item.get("html_url", "")).strip()
+            score_raw = item.get("score", 0.0)
+            try:
+                score = float(score_raw or 0.0)
+            except Exception:
+                score = 0.0
+
+            snippet = ""
+            text_matches = item.get("text_matches", [])
+            if isinstance(text_matches, list) and text_matches:
+                first_match = text_matches[0]
+                if isinstance(first_match, Mapping):
+                    snippet = str(first_match.get("fragment", "")).strip()
+                    snippet = re.sub(r"\s+", " ", snippet)
+                    if len(snippet) > 300:
+                        snippet = f"{snippet[:297]}..."
+
+            hits.append(
+                {
+                    "path": item_path,
+                    "html_url": html_url,
+                    "score": score,
+                    "snippet": snippet,
+                }
+            )
+
+        return True, {
+            "repo": normalized_repo,
+            "query": query_value,
+            "path_filter": normalized_path,
+            "total_count": int(data.get("total_count", len(hits)) or 0),
+            "incomplete_results": bool(data.get("incomplete_results", False)),
+            "hits": hits,
         }
 
     async def _send_text_to_github(
@@ -1931,6 +2261,17 @@ class GitHubAppAdapter(Platform):
         event.set_extra("github_repository", parsed.repository)
         event.set_extra("github_session_id", parsed.session_id)
         event.set_extra("github_sender_is_bot", parsed.sender_is_bot)
+        route = _parse_session_route(parsed.session_id, parsed.installation_id)
+        if route is not None:
+            event.set_extra("github_thread_type", route.thread_type)
+            if route.thread_number is not None:
+                event.set_extra("github_thread_number", route.thread_number)
+        thread_title = _extract_thread_title_from_payload(payload)
+        if thread_title:
+            event.set_extra("github_thread_title", thread_title)
+        thread_url = _extract_thread_url_from_payload(payload)
+        if thread_url:
+            event.set_extra("github_thread_url", thread_url)
         if parsed.installation_id is not None:
             event.set_extra("github_installation_id", parsed.installation_id)
         return event

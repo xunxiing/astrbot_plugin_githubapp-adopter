@@ -1,161 +1,115 @@
 {
   "private_key_files": {
-    "description": "GitHub App 私钥文件（.pem）",
+    "description": "GitHub App private key files (.pem)",
     "type": "file",
     "file_types": [
       "pem"
     ],
-    "hint": "上传一个或多个 GitHub App 私钥文件，插件会使用第一个有效 PEM。",
+    "hint": "Upload one or more GitHub App private key files. The first valid PEM will be used.",
     "default": []
   },
   "default_github_events": {
-    "description": "默认订阅的 GitHub 事件",
+    "description": "Default subscribed GitHub events",
     "type": "list",
-    "hint": "当平台级 github_events 为空时使用；留空表示订阅全部已支持事件。",
+    "hint": "Used when platform-level github_events is empty. Empty means subscribe all supported events.",
     "default": []
   },
   "default_wake_event_types": {
-    "description": "默认唤醒事件类型",
+    "description": "Default wake event types",
     "type": "list",
-    "hint": "当平台级 wake_event_types 为空时使用。",
+    "hint": "Used when platform-level wake_event_types is empty.",
     "default": [
       "issues",
       "pull_request"
     ]
   },
   "default_wake_on_mentions": {
-    "description": "默认 @ 提及时唤醒",
+    "description": "Default wake on @mention",
     "type": "bool",
-    "hint": "当平台级 wake_on_mentions 未显式设置时使用。",
+    "hint": "Used when platform-level wake_on_mentions is not explicitly set.",
     "default": true
   },
   "default_mention_target_logins": {
-    "description": "默认提及目标登录名",
+    "description": "Default mention target logins",
     "type": "list",
-    "hint": "仅当 @login 命中这些值时，按提及触发唤醒。",
+    "hint": "Wake only when @login matches one of these values.",
     "default": []
   },
   "default_ignore_bot_sender_events": {
-    "description": "默认忽略 Bot 发送者事件",
+    "description": "Default ignore bot sender events",
     "type": "bool",
-    "hint": "忽略 sender.type 为 Bot 的 webhook 事件。",
+    "hint": "Ignore webhook events where sender.type is Bot.",
     "default": true
   },
   "enable_signature_validation": {
-    "description": "启用 webhook 签名校验",
+    "description": "Enable webhook signature validation",
     "type": "bool",
     "default": true
   },
   "delivery_cache_ttl_seconds": {
-    "description": "Delivery 去重缓存 TTL（秒）",
+    "description": "Delivery dedup cache TTL (seconds)",
     "type": "int",
     "default": 900,
-    "hint": "用于防重放的去重缓存存活时长（秒）。"
+    "hint": "Dedup cache lifetime used for replay protection."
   },
   "delivery_cache_max_entries": {
-    "description": "Delivery 去重缓存最大条目数",
+    "description": "Delivery dedup cache max entries",
     "type": "int",
     "default": 10000,
-    "hint": "内存去重缓存的上限。"
+    "hint": "Upper limit of in-memory dedup cache entries."
   },
   "auto_create_github_skill": {
-    "description": "插件加载时自动创建 GitHub skill",
+    "description": "Auto create GitHub skill on plugin load",
     "type": "bool",
     "default": true,
-    "hint": "自动在 data/skills 下创建或更新 skill，并激活。"
+    "hint": "Create or update SKILL.md under data/skills and activate it."
   },
   "github_skill_name": {
-    "description": "GitHub skill 目录名",
+    "description": "GitHub skill directory name",
     "type": "string",
     "default": "github_app_ops",
-    "hint": "data/skills 下的目录名，建议仅使用字母、数字、点、下划线和短横线。"
+    "hint": "Directory name under data/skills. Recommended: letters, numbers, dot, underscore, hyphen."
   },
   "overwrite_github_skill": {
-    "description": "覆盖插件生成的 GitHub skill",
+    "description": "Overwrite generated GitHub skill",
     "type": "bool",
     "default": true,
-    "hint": "开启后插件加载时会覆盖 SKILL.md，确保说明与代码同步。"
-  },
-  "force_token_permission_policy": {
-    "description": "启用临时令牌权限策略",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后按 token_default_permissions / token_max_permissions 做权限裁剪。"
-  },
-  "token_default_permissions": {
-    "description": "默认请求权限",
-    "type": "string",
-    "default": "contents=read,pull_requests=write,issues=write",
-    "hint": "当工具未显式传 permissions 时使用。支持 a=b,c=d 或 JSON。"
-  },
-  "token_max_permissions": {
-    "description": "权限上限",
-    "type": "string",
-    "default": "contents=write,pull_requests=write,issues=write",
-    "hint": "工具请求权限会被裁剪到该上限；不在列表中的权限会被丢弃。"
-  },
-  "enable_privileged_write_mode": {
-    "description": "开启高权限写入模式",
-    "type": "bool",
-    "default": false,
-    "hint": "默认关闭。关闭时会强制把 contents=write 降为 contents=read。"
+    "hint": "When enabled, plugin load will overwrite SKILL.md to keep docs aligned with code."
   },
   "enable_direct_repo_write_tool": {
-    "description": "启用受控仓库写入工具",
+    "description": "Enable controlled repository write tool",
     "type": "bool",
     "default": false,
-    "hint": "开启后可使用 github_app_create_license_pr 这类不暴露 token 的受控工具。"
+    "hint": "When enabled, github_create_license_pr can create branch/commit/PR without exposing token to LLM."
   },
-  "enable_issue_token_tool": {
-    "description": "启用旧版 token 工具",
+  "enable_auto_sandbox_workspace_prepare": {
+    "description": "Auto prepare sandbox workspace for GitHub session shell",
     "type": "bool",
     "default": true,
-    "hint": "保留 legacy token 流程（github_app_issue_token）。"
+    "hint": "When enabled, shell calls in GitHub sessions auto-enter a session workspace and auto-clone repo if missing."
   },
-  "privileged_mode_require_whitelist": {
-    "description": "高权限模式启用全程白名单",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后，在高权限模式下 shell/python 工具调用必须命中白名单。"
+  "sandbox_workspace_root": {
+    "description": "Sandbox workspace root path",
+    "type": "string",
+    "default": "/tmp/github-workspaces",
+    "hint": "Root directory used for session workspaces inside sandbox."
   },
-  "privileged_mode_shell_allowlist_patterns": {
-    "description": "高权限模式 shell 白名单正则",
-    "type": "list",
-    "default": [
-      "^\\s*export\\s+GH_TOKEN=.*$",
-      "^\\s*unset\\s+GH_TOKEN\\s*$",
-      "^\\s*Remove-Item\\s+Env:GH_TOKEN\\b.*$",
-      "^\\s*curl\\b[\\s\\S]*api\\.github\\.com/repos/[^/\\s]+/[^/\\s]+/(branches/[^/\\s]+|git/refs|contents/[^\\\"'\\s]+|pulls|issues)\\b[\\s\\S]*$",
-      "^\\s*gh\\b[\\s\\S]*$",
-      "^\\s*git\\b[\\s\\S]*$"
-    ],
-    "hint": "按命令分段匹配（&&/;/|）。未命中任一模式会被拦截。"
-  },
-  "privileged_mode_python_allowlist_patterns": {
-    "description": "高权限模式 python 白名单正则",
-    "type": "list",
-    "default": [],
-    "hint": "默认空列表（即高权限模式下 python 调用默认拦截），按需配置。"
+  "sandbox_workspace_clone_depth": {
+    "description": "Sandbox clone depth",
+    "type": "int",
+    "default": 1,
+    "hint": "Depth for initial auto clone when workspace repository is missing."
   },
   "enforce_tool_write_guard": {
-    "description": "启用工具写入防护",
+    "description": "Enable shell/python token literal guard",
     "type": "bool",
-    "default": true,
-    "hint": "启用后会检查 shell/python 工具命令的风险操作并执行拦截。"
-  },
-  "guard_protected_branches": {
-    "description": "受保护分支列表",
-    "type": "list",
-    "default": [
-      "main",
-      "master"
-    ],
-    "hint": "拦截直接写入这些分支（如 git push 或 refs/heads/<branch>）。"
+    "default": false,
+    "hint": "Only blocks plain ghs_... token literals in tool arguments. It does not restrict local git/shell behavior."
   },
   "guard_block_token_literal": {
-    "description": "拦截明文 token 字面量",
+    "description": "Block plain token literals",
     "type": "bool",
     "default": true,
-    "hint": "拦截 shell/python 命令中出现 ghs_... 明文 token 的调用。"
+    "hint": "When guard is enabled, block shell/python calls containing plain ghs_... token literals."
   }
 }
