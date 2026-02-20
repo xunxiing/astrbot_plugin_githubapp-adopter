@@ -1,4 +1,4 @@
-# astrbot_plugin_githubapp-adopter
+# astrbot_plugin_githubapp-adqpter
 
 GitHub App adapter plugin for AstrBot.
 
