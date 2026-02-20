@@ -76,12 +76,6 @@
     "default": true,
     "hint": "启用后，插件加载时会覆盖技能说明文件，确保文档与代码一致。"
   },
-  "enable_direct_repo_write_tool": {
-    "description": "启用受控仓库写入工具",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后，可在不向大模型暴露令牌的前提下创建分支、提交并发起合并请求。"
-  },
   "enable_fake_token_bridge": {
     "description": "启用假令牌替换桥接",
     "type": "bool",

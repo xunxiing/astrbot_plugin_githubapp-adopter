@@ -21,7 +21,6 @@ from .workflow.sandbox_workspace import (
 )
 
 GITHUB_ADAPTER_TYPE = "github_app"
-GITHUB_CREATE_LICENSE_PR_TOOL_NAME = "github_create_license_pr"
 GITHUB_REPO_LS_TOOL_NAME = "github_repo_ls"
 GITHUB_REPO_READ_TOOL_NAME = "github_repo_read"
 GITHUB_REPO_SEARCH_TOOL_NAME = "github_repo_search"
@@ -48,7 +47,6 @@ SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 GITHUB_TOKEN_LITERAL_RE = re.compile(r"\bghs_[A-Za-z0-9_]{20,}\b")
 GITHUB_FAKE_TOKEN_LITERAL_RE = re.compile(r"\bghu_fake_[A-Za-z0-9]{24,}\b")
 GITHUB_ONLY_LLM_TOOLS = {
-    GITHUB_CREATE_LICENSE_PR_TOOL_NAME,
     GITHUB_REPO_LS_TOOL_NAME,
     GITHUB_REPO_READ_TOOL_NAME,
     GITHUB_REPO_SEARCH_TOOL_NAME,
@@ -129,20 +127,6 @@ def _extract_repo_from_github_session(session_id: str) -> str:
     return repo
 
 
-def _extract_issue_number_from_github_session(session_id: str) -> int:
-    if not isinstance(session_id, str):
-        return 0
-    parts = session_id.split(":", 3)
-    if len(parts) != 4:
-        return 0
-    if parts[0] != "github" or parts[2] != "issue":
-        return 0
-    raw_number = str(parts[3]).strip()
-    if not raw_number.isdigit():
-        return 0
-    return int(raw_number)
-
-
 def _extract_thread_meta_from_github_session(session_id: str) -> tuple[str, int | None]:
     if not isinstance(session_id, str):
         return "", None
@@ -182,7 +166,6 @@ description: GitHub 应用操作技能。仅使用受控工具。
 
 ## Priority
 
-- 需要添加许可证并创建合并请求时，调用 `{GITHUB_CREATE_LICENSE_PR_TOOL_NAME}`。
 - 浏览仓库结构时，先调用 `{GITHUB_REPO_LS_TOOL_NAME}`。
 - 阅读文件内容时，调用 `{GITHUB_REPO_READ_TOOL_NAME}`。
 - 关键字检索代码时，调用 `{GITHUB_REPO_SEARCH_TOOL_NAME}`。
@@ -190,8 +173,7 @@ description: GitHub 应用操作技能。仅使用受控工具。
 ## Typical flow
 
 1. 先解析仓库标识 `owner/repo`。
-2. 如需添加许可证并创建合并请求，使用许可证工具。
-3. 处理代码问题时，先列目录，再分段读取文件。
+2. 处理代码问题时，先列目录，再分段读取文件。
 """
 
 def _ensure_github_skill(config: Mapping[str, Any] | None) -> str:
@@ -613,110 +595,6 @@ class GitHubAppAdapterPlugin(Star):
                 )
 
         tool_args[source_key] = runtime_text
-
-    @filter.llm_tool(name=GITHUB_CREATE_LICENSE_PR_TOOL_NAME)
-    async def github_create_license_pr(
-        self,
-        event: AstrMessageEvent,
-        repo: str = "",
-        issue_number: int = 0,
-        platform_id: str = "",
-        branch_name: str = "",
-        license_type: str = "MIT",
-        pr_title: str = "",
-        pr_body: str = "",
-    ) -> str:
-        """受控工具：在仓库创建 LICENSE 并发起合并请求，不向模型暴露令牌。
-
-        Args:
-            repo(string): 目标仓库，格式 owner/repo；为空时从当前 GitHub 会话自动解析。
-            issue_number(number): 可选，关联 issue 编号；<=0 时自动从会话解析。
-            platform_id(string): 可选，当存在多个 github_app 平台时可指定。
-            branch_name(string): 可选，目标分支名。
-            license_type(string): 许可证类型，当前仅支持 MIT。
-            pr_title(string): 可选，合并请求标题。
-            pr_body(string): 可选，合并请求描述。
-        """
-        if event.get_platform_name() != GITHUB_ADAPTER_TYPE:
-            return "该工具仅在 github_app 平台会话中可用。"
-
-        runtime_cfg = get_runtime_plugin_config()
-        if not bool(runtime_cfg.get("enable_direct_repo_write_tool", False)):
-            return (
-                "direct repo write tool is disabled. "
-                "Please set enable_direct_repo_write_tool=true."
-            )
-
-        adapter = self._resolve_github_adapter(event, platform_id)
-        if adapter is None:
-            return "未找到可用的 github_app 平台适配器。"
-        if not hasattr(adapter, "create_license_pr_for_skill"):
-            return "当前 github_app 适配器不支持受控合并请求工具，请升级插件。"
-
-        repo_value = str(repo or "").strip()
-        if not repo_value:
-            repo_value = str(event.get_extra("github_repository", "")).strip()
-        if not repo_value:
-            repo_value = _extract_repo_from_github_session(
-                str(event.get_extra("github_session_id", "")).strip()
-            )
-        if not repo_value and event.get_platform_name() == GITHUB_ADAPTER_TYPE:
-            repo_value = _extract_repo_from_github_session(event.get_session_id())
-        if not repo_value:
-            return "缺少 repo 参数，格式应为 owner/repo。"
-
-        try:
-            resolved_issue_number = int(issue_number or 0)
-        except Exception:
-            resolved_issue_number = 0
-        if resolved_issue_number <= 0:
-            resolved_issue_number = 0
-        if resolved_issue_number <= 0:
-            resolved_issue_number = _extract_issue_number_from_github_session(
-                str(event.get_extra("github_session_id", "")).strip()
-            )
-        if resolved_issue_number <= 0 and event.get_platform_name() == GITHUB_ADAPTER_TYPE:
-            resolved_issue_number = _extract_issue_number_from_github_session(
-                event.get_session_id()
-            )
-        if resolved_issue_number <= 0:
-            resolved_issue_number = None
-
-        ok, payload = await adapter.create_license_pr_for_skill(
-            repo=repo_value,
-            issue_number=resolved_issue_number,
-            branch_name=branch_name,
-            license_type=license_type,
-            pr_title=pr_title,
-            pr_body=pr_body,
-        )
-        if not ok:
-            detail = str(payload.get("error", "unknown error"))
-            stage = str(payload.get("stage", "")).strip()
-            if stage:
-                return f"创建 LICENSE 合并请求失败（{stage}）：{detail}"
-            return f"创建 LICENSE 合并请求失败：{detail}"
-
-        pr_url = str(payload.get("pr_url", "")).strip()
-        pr_number = int(payload.get("pr_number", 0) or 0)
-        target_repo = str(payload.get("repo", repo_value)).strip()
-        head_branch = str(payload.get("head_branch", "")).strip()
-        base_branch = str(payload.get("base_branch", "")).strip()
-        existing = bool(payload.get("existing_pr", False))
-
-        lines = [
-            "LICENSE 合并请求已创建成功。",
-            f"repo: {target_repo}",
-            f"base_branch: {base_branch}",
-            f"head_branch: {head_branch}",
-        ]
-        if pr_number > 0:
-            lines.append(f"pr_number: {pr_number}")
-        if pr_url:
-            lines.append(f"pr_url: {pr_url}")
-        if existing:
-            lines.append("说明: 已存在同分支合并请求，本次返回已有结果。")
-        return "\n".join(lines)
 
     @filter.llm_tool(name=GITHUB_REPO_LS_TOOL_NAME)
     async def github_repo_ls(

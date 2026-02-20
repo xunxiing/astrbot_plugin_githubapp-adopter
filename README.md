@@ -4,9 +4,6 @@
 
 ## 工具
 
-- `github_create_license_pr`
-  - 受控写入：创建或复用分支、写入 `LICENSE`（MIT）、创建 PR。
-  - 令牌仅在插件内部使用，不向 LLM 暴露。
 - `github_repo_ls`
   - 只读列目录：按一层目录返回文件与文件夹，支持分页。
 - `github_repo_read`
@@ -19,7 +16,6 @@
 - GitHub 工具仅在 `github_app` 会话中暴露。
 - LLM 可在沙盒中使用本地 shell/git。
 - GitHub 会话可自动准备沙盒工作区，并在缺少仓库时自动克隆。
-- 远程写入（分支/提交/PR）仅通过受控工具执行。
 - GitHub 会话会向模型注入仓库、线程标题、线程编号和工作区路径上下文。
 - 插件不会向模型返回真实 GitHub 令牌；仅可选下发短期假令牌占位符。
 - 工具执行前会将假令牌占位符替换为最小权限的真实只读令牌。
@@ -27,7 +23,6 @@
 
 ## 关键配置
 
-- `enable_direct_repo_write_tool=true`：启用 `github_create_license_pr`。
 - `enable_fake_token_bridge=true`（默认）：启用假令牌占位与执行前替换。
 - `fake_token_ttl_seconds=900`（默认）：假令牌最大有效期。
 - `enable_auto_sandbox_workspace_prepare=true`（默认）：自动准备沙盒工作区。
